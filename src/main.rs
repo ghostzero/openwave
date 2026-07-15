@@ -11,12 +11,16 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| ui::load_css());
     app.connect_activate(|app| {
-        if let Some(window) = app.active_window() {
+        // Closing only hides the window; re-activation brings it back.
+        if let Some(window) = app
+            .active_window()
+            .or_else(|| app.windows().into_iter().next())
+        {
             window.present();
             return;
         }
         ui::window::build(app).present();
     });
-    app.set_accels_for_action("window.close", &["<primary>q"]);
+    app.set_accels_for_action("app.quit", &["<primary>q"]);
     app.run()
 }

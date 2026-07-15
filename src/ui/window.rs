@@ -127,6 +127,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
 
     let menu = gio::Menu::new();
     menu.append(Some("About OpenWave"), Some("win.about"));
+    menu.append(Some("Quit"), Some("app.quit"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .menu_model(&menu)
@@ -193,6 +194,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         });
     }
     wire_close(&app, &window);
+    wire_quit(&app, application, &window);
 
     rebuild_strips(&app);
     app.manager.connect_server();
@@ -669,8 +671,9 @@ fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
         if let Some(win) = win_weak.upgrade() {
             let dialog = adw::AboutDialog::builder()
                 .application_name("OpenWave")
-                .application_icon("audio-card")
-                .developer_name("GhostZero")
+                .application_icon("de.ghostzero.OpenWave")
+                .developer_name("René Preuß")
+                .copyright("© 2026 René Preuß")
                 .version(env!("CARGO_PKG_VERSION"))
                 .comments(
                     "Dual-mix virtual audio mixer for Linux. \
@@ -685,28 +688,62 @@ fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
     window.add_action(&about);
 }
 
+/// Closing the window only hides it: the virtual devices and all routing
+/// keep working in the background. Launching the app again (or activating
+/// it from the shell) brings the window back; "Quit" tears everything down.
 fn wire_close(app: &Rc<App>, window: &adw::ApplicationWindow) {
     let app = app.clone();
+    let notified = Cell::new(false);
     window.connect_close_request(move |win| {
         app.config.borrow().save();
-        let done = Rc::new(Cell::new(false));
-        {
-            let done = done.clone();
-            let win = win.clone();
-            app.manager.shutdown(Box::new(move || {
-                if !done.replace(true) {
-                    win.destroy();
-                }
-            }));
-        }
-        {
-            let win = win.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-                if !done.replace(true) {
-                    win.destroy();
-                }
-            });
+        win.set_visible(false);
+        if !notified.replace(true) {
+            if let Some(gapp) = win.application() {
+                let note = gio::Notification::new("OpenWave is still running");
+                note.set_body(Some(
+                    "The virtual audio devices stay active in the background. \
+                     Use Quit in the main menu to stop them.",
+                ));
+                gapp.send_notification(Some("openwave-background"), &note);
+            }
         }
         glib::Propagation::Stop
     });
+}
+
+/// app.quit: save, unload everything we created on the audio server, then
+/// really exit.
+fn wire_quit(app: &Rc<App>, application: &adw::Application, window: &adw::ApplicationWindow) {
+    let quit = gio::SimpleAction::new("quit", None);
+    let outer_application = application.clone();
+    let app = app.clone();
+    let application = application.clone();
+    let window = window.clone();
+    quit.connect_activate(move |_, _| {
+        app.config.borrow().save();
+        let done = Rc::new(Cell::new(false));
+        let finish = {
+            let application = application.clone();
+            let window = window.clone();
+            move || {
+                window.destroy();
+                application.quit();
+            }
+        };
+        {
+            let done = done.clone();
+            let finish = finish.clone();
+            app.manager.shutdown(Box::new(move || {
+                if !done.replace(true) {
+                    finish();
+                }
+            }));
+        }
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+            if !done.replace(true) {
+                finish();
+            }
+        });
+    });
+    outer_application.add_action(&quit);
 }
