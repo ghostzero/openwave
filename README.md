@@ -40,6 +40,9 @@ quietly, or hear a voice chat that never reaches your stream at all.
 - **Self-healing routing**: OpenWave re-applies volumes and re-attaches
   streams if the session manager moves them, and cleans up stale devices
   from crashed sessions on startup.
+- **Background operation**: closing the window keeps the virtual devices
+  running; enable *Start at Login* in the main menu and OpenWave launches
+  hidden on login, so your audio setup is always ready.
 - Configuration persists across restarts at
   `~/.config/openwave/config.json`.
 

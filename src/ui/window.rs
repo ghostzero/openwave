@@ -126,8 +126,13 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         .build();
 
     let menu = gio::Menu::new();
-    menu.append(Some("About OpenWave"), Some("win.about"));
-    menu.append(Some("Quit"), Some("app.quit"));
+    let menu_settings = gio::Menu::new();
+    menu_settings.append(Some("Start at Login"), Some("win.autostart"));
+    menu.append_section(None, &menu_settings);
+    let menu_general = gio::Menu::new();
+    menu_general.append(Some("About OpenWave"), Some("win.about"));
+    menu_general.append(Some("Quit"), Some("app.quit"));
+    menu.append_section(None, &menu_general);
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .menu_model(&menu)
@@ -647,7 +652,69 @@ fn wire_outputs(app: &Rc<App>) {
 
 // ---- Window actions -------------------------------------------------------------
 
+// ---- Autostart -------------------------------------------------------------
+
+fn autostart_file() -> std::path::PathBuf {
+    glib::user_config_dir()
+        .join("autostart")
+        .join(format!("{}.desktop", crate::APP_ID))
+}
+
+fn autostart_enabled() -> bool {
+    autostart_file().exists()
+}
+
+/// Enable/disable launch-on-login via an XDG autostart entry. The entry runs
+/// the current executable with --hidden so the virtual devices come up in
+/// the background without opening the window.
+fn set_autostart(enable: bool) -> std::io::Result<()> {
+    let path = autostart_file();
+    if !enable {
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "openwave".to_string());
+    std::fs::write(
+        &path,
+        format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=OpenWave\n\
+             Comment=Dual-mix virtual audio mixer for streaming\n\
+             Exec={exe} --hidden\n\
+             Icon={}\n\
+             Terminal=false\n\
+             X-GNOME-Autostart-enabled=true\n",
+            crate::APP_ID
+        ),
+    )
+}
+
 fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
+    let autostart = gio::SimpleAction::new_stateful(
+        "autostart",
+        None,
+        &autostart_enabled().to_variant(),
+    );
+    autostart.connect_activate(|action, _| {
+        let enable = !action
+            .state()
+            .and_then(|s| s.get::<bool>())
+            .unwrap_or(false);
+        match set_autostart(enable) {
+            Ok(()) => action.set_state(&enable.to_variant()),
+            Err(e) => eprintln!("openwave: could not update autostart entry: {e}"),
+        }
+    });
+    window.add_action(&autostart);
+
     let add = gio::SimpleAction::new("add-channel", Some(glib::VariantTy::STRING));
     {
         let app = app.clone();
