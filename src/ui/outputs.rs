@@ -23,6 +23,9 @@ pub struct OutputsPanel {
     /// Sink name behind each device drop-down position; `None` = system default.
     pub sink_entries: RefCell<Vec<Option<String>>>,
     last_labels: RefCell<Vec<String>>,
+    /// Keep both rows' columns equally wide.
+    _middle_size_group: gtk::SizeGroup,
+    _titles_size_group: gtk::SizeGroup,
 }
 
 fn master_scale(tooltip: &str) -> gtk::Scale {
@@ -38,10 +41,11 @@ fn output_row(
     icon: &str,
     title: &str,
     subtitle: &str,
-    middle: Option<&gtk::Widget>,
+    middle: &gtk::Widget,
     level: &gtk::LevelBar,
     scale: &gtk::Scale,
     mute: &gtk::ToggleButton,
+    titles_group: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
     let hbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -72,19 +76,11 @@ fn output_row(
     subtitle_label.add_css_class("dim-label");
     titles.append(&title_label);
     titles.append(&subtitle_label);
+    titles_group.add_widget(&titles);
     hbox.append(&titles);
 
-    match middle {
-        Some(w) => {
-            w.set_size_request(230, -1);
-            hbox.append(w);
-        }
-        None => {
-            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            spacer.set_size_request(230, -1);
-            hbox.append(&spacer);
-        }
-    }
+    middle.set_size_request(230, -1);
+    hbox.append(middle);
 
     let meters = gtk::Box::new(gtk::Orientation::Vertical, 6);
     meters.set_hexpand(true);
@@ -113,8 +109,10 @@ impl OutputsPanel {
             .valign(gtk::Align::Center)
             .tooltip_text("Device the monitor mix is played on")
             .build();
-        monitor_device.set_factory(Some(&label_factory(20)));
-        monitor_device.set_list_factory(Some(&label_factory(44)));
+        monitor_device.set_factory(Some(&label_factory(18, true)));
+        monitor_device.set_list_factory(Some(&label_factory(44, false)));
+
+        let titles_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
         let monitor_level = meter_bar();
         let monitor_scale = master_scale("Monitor mix master volume");
@@ -123,24 +121,34 @@ impl OutputsPanel {
             "audio-headphones-symbolic",
             "Monitor Mix",
             "What you hear locally",
-            Some(monitor_device.upcast_ref()),
+            monitor_device.upcast_ref(),
             &monitor_level,
             &monitor_scale,
             &monitor_mute,
+            &titles_group,
         );
 
         let stream_level = meter_bar();
         let stream_scale = master_scale("Stream mix master volume");
         let stream_mute = mute_button("media-record-symbolic", "Mute the stream mix");
+        let stream_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let stream_row = output_row(
             "audio-input-microphone-symbolic",
             "Stream Mix",
             "Select “Virtual Stream Mix” as microphone in OBS, Discord, etc.",
-            None,
+            stream_spacer.upcast_ref(),
             &stream_level,
             &stream_scale,
             &stream_mute,
+            &titles_group,
         );
+
+        // Keep the middle column of both rows equally wide so the level
+        // meters and master sliders line up exactly. The titles group does
+        // the same for the title/subtitle column.
+        let middle_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+        middle_group.add_widget(&monitor_device);
+        middle_group.add_widget(&stream_spacer);
 
         root.append(&monitor_row);
         root.append(&stream_row);
@@ -157,6 +165,8 @@ impl OutputsPanel {
             guard: Rc::new(Cell::new(false)),
             sink_entries: RefCell::new(Vec::new()),
             last_labels: RefCell::new(Vec::new()),
+            _middle_size_group: middle_group,
+            _titles_size_group: titles_group,
         }
     }
 

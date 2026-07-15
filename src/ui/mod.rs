@@ -64,8 +64,10 @@ pub fn meter_bar() -> gtk::LevelBar {
 }
 
 /// List-item factory rendering plain strings with end-ellipsizing, for use in
-/// drop-downs whose entries can be long device names.
-pub fn label_factory(max_chars: i32) -> gtk::SignalListItemFactory {
+/// drop-downs whose entries can be long device names. With `fixed` the label
+/// always requests exactly `chars` characters, so the drop-down (and its
+/// container) keeps the same width regardless of the selected item.
+pub fn label_factory(chars: i32, fixed: bool) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, obj| {
         let Some(item) = obj.downcast_ref::<gtk::ListItem>() else {
@@ -74,8 +76,11 @@ pub fn label_factory(max_chars: i32) -> gtk::SignalListItemFactory {
         let label = gtk::Label::builder()
             .xalign(0.0)
             .ellipsize(pango::EllipsizeMode::End)
-            .max_width_chars(max_chars)
+            .max_width_chars(chars)
             .build();
+        if fixed {
+            label.set_width_chars(chars);
+        }
         item.set_child(Some(&label));
     });
     factory.connect_bind(|_, obj| {

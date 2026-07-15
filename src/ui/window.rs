@@ -29,6 +29,8 @@ struct App {
     save_pending: Cell<bool>,
     /// Per-channel edit counter used to debounce rename → sink rebuild.
     rename_epoch: RefCell<HashMap<u64, u64>>,
+    /// Forces every strip and the add-channel card to the same width.
+    strip_size_group: gtk::SizeGroup,
 }
 
 pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
@@ -67,6 +69,9 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         .build();
     add_button.add_css_class("card");
     add_button.add_css_class("flat");
+
+    let strip_size_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    strip_size_group.add_widget(&add_button);
 
     let mixer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -174,6 +179,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         error_page,
         save_pending: Cell::new(false),
         rename_epoch: RefCell::new(HashMap::new()),
+        strip_size_group,
     });
 
     wire_actions(&app, &window);
@@ -326,9 +332,16 @@ fn rebuild_strips(app: &Rc<App>) {
     for ch in &channels {
         let strip = ChannelStrip::new();
         strip.load_config(ch);
-        strip.remove.set_visible(!ch.permanent);
+        if ch.permanent {
+            // Keep the button allocated so permanent strips get the exact
+            // same header layout as removable ones.
+            strip.remove.set_opacity(0.0);
+            strip.remove.set_sensitive(false);
+            strip.remove.set_tooltip_text(None);
+        }
         wire_strip(app, &strip, ch.id);
         app.strips_box.append(&strip.root);
+        app.strip_size_group.add_widget(&strip.root);
         strips.push((ch.id, strip));
     }
     app.strips_box.append(&app.add_button);

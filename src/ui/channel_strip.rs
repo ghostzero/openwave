@@ -66,7 +66,7 @@ impl ChannelStrip {
 
         let name = gtk::EditableLabel::builder()
             .text("")
-            .xalign(0.5)
+            .xalign(0.0)
             .hexpand(true)
             .max_width_chars(12)
             .tooltip_text("Rename channel")
@@ -88,8 +88,8 @@ impl ChannelStrip {
         let input = gtk::DropDown::builder()
             .tooltip_text("Select the input for this channel")
             .build();
-        input.set_factory(Some(&label_factory(11)));
-        input.set_list_factory(Some(&label_factory(36)));
+        input.set_factory(Some(&label_factory(9, true)));
+        input.set_list_factory(Some(&label_factory(36, false)));
 
         let level = meter_bar();
 
