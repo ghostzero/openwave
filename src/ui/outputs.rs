@@ -1,0 +1,193 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use adw::prelude::*;
+
+use crate::config::MasterConfig;
+
+use super::{label_factory, meter_bar, mute_button};
+
+/// The OUTPUTS section: one row for the monitor mix (with hardware device
+/// selector) and one for the stream mix, each with level meter, master volume
+/// and master mute.
+pub struct OutputsPanel {
+    pub root: gtk::ListBox,
+    pub monitor_device: gtk::DropDown,
+    pub monitor_level: gtk::LevelBar,
+    pub monitor_scale: gtk::Scale,
+    pub monitor_mute: gtk::ToggleButton,
+    pub stream_level: gtk::LevelBar,
+    pub stream_scale: gtk::Scale,
+    pub stream_mute: gtk::ToggleButton,
+    pub guard: Rc<Cell<bool>>,
+    /// Sink name behind each device drop-down position; `None` = system default.
+    pub sink_entries: RefCell<Vec<Option<String>>>,
+    last_labels: RefCell<Vec<String>>,
+}
+
+fn master_scale(tooltip: &str) -> gtk::Scale {
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    scale.set_draw_value(false);
+    scale.set_hexpand(true);
+    scale.set_tooltip_text(Some(tooltip));
+    scale
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_row(
+    icon: &str,
+    title: &str,
+    subtitle: &str,
+    middle: Option<&gtk::Widget>,
+    level: &gtk::LevelBar,
+    scale: &gtk::Scale,
+    mute: &gtk::ToggleButton,
+) -> gtk::ListBoxRow {
+    let hbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class("dim-label");
+    hbox.append(&image);
+
+    let titles = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    titles.set_width_request(190);
+    titles.set_valign(gtk::Align::Center);
+    let title_label = gtk::Label::builder().label(title).xalign(0.0).build();
+    title_label.add_css_class("heading");
+    let subtitle_label = gtk::Label::builder()
+        .label(subtitle)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(30)
+        .tooltip_text(subtitle)
+        .build();
+    subtitle_label.add_css_class("caption");
+    subtitle_label.add_css_class("dim-label");
+    titles.append(&title_label);
+    titles.append(&subtitle_label);
+    hbox.append(&titles);
+
+    match middle {
+        Some(w) => {
+            w.set_size_request(230, -1);
+            hbox.append(w);
+        }
+        None => {
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_size_request(230, -1);
+            hbox.append(&spacer);
+        }
+    }
+
+    let meters = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    meters.set_hexpand(true);
+    meters.set_valign(gtk::Align::Center);
+    meters.append(level);
+    meters.append(scale);
+    hbox.append(&meters);
+
+    hbox.append(mute);
+
+    gtk::ListBoxRow::builder()
+        .activatable(false)
+        .selectable(false)
+        .child(&hbox)
+        .build()
+}
+
+impl OutputsPanel {
+    pub fn new() -> Self {
+        let root = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+
+        let monitor_device = gtk::DropDown::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text("Device the monitor mix is played on")
+            .build();
+        monitor_device.set_factory(Some(&label_factory(20)));
+        monitor_device.set_list_factory(Some(&label_factory(44)));
+
+        let monitor_level = meter_bar();
+        let monitor_scale = master_scale("Monitor mix master volume");
+        let monitor_mute = mute_button("audio-headphones-symbolic", "Mute the monitor mix");
+        let monitor_row = output_row(
+            "audio-headphones-symbolic",
+            "Monitor Mix",
+            "What you hear locally",
+            Some(monitor_device.upcast_ref()),
+            &monitor_level,
+            &monitor_scale,
+            &monitor_mute,
+        );
+
+        let stream_level = meter_bar();
+        let stream_scale = master_scale("Stream mix master volume");
+        let stream_mute = mute_button("media-record-symbolic", "Mute the stream mix");
+        let stream_row = output_row(
+            "audio-input-microphone-symbolic",
+            "Stream Mix",
+            "Select “Virtual Stream Mix” as microphone in OBS, Discord, etc.",
+            None,
+            &stream_level,
+            &stream_scale,
+            &stream_mute,
+        );
+
+        root.append(&monitor_row);
+        root.append(&stream_row);
+
+        Self {
+            root,
+            monitor_device,
+            monitor_level,
+            monitor_scale,
+            monitor_mute,
+            stream_level,
+            stream_scale,
+            stream_mute,
+            guard: Rc::new(Cell::new(false)),
+            sink_entries: RefCell::new(Vec::new()),
+            last_labels: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn load_config(&self, m: &MasterConfig) {
+        self.guard.set(true);
+        self.monitor_scale.set_value(m.monitor_volume);
+        self.stream_scale.set_value(m.stream_volume);
+        self.monitor_mute.set_active(m.monitor_muted);
+        self.stream_mute.set_active(m.stream_muted);
+        self.guard.set(false);
+    }
+
+    /// Rebuild the monitor output device selector.
+    pub fn set_output_sinks(
+        &self,
+        items: &[(String, Option<String>)],
+        current: &Option<String>,
+    ) {
+        let labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
+        let entries: Vec<Option<String>> = items.iter().map(|(_, n)| n.clone()).collect();
+        let selected = entries.iter().position(|e| e == current).unwrap_or(0) as u32;
+        if *self.last_labels.borrow() == labels && self.monitor_device.selected() == selected {
+            return;
+        }
+        self.guard.set(true);
+        let strs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let model = gtk::StringList::new(&strs);
+        self.monitor_device.set_model(Some(&model));
+        self.monitor_device.set_selected(selected);
+        self.guard.set(false);
+        *self.last_labels.borrow_mut() = labels;
+        *self.sink_entries.borrow_mut() = entries;
+    }
+}
