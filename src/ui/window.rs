@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::audio::{AudioEvent, LevelTarget, Mix, PulseManager};
-use crate::config::{Assignment, Config, CHANNEL_COUNT};
+use crate::config::{Assignment, Config, MAX_CHANNELS};
 
 use super::channel_strip::ChannelStrip;
 use super::heading_label;
@@ -16,43 +17,56 @@ use super::sidebar::Sidebar;
 struct App {
     config: Rc<RefCell<Config>>,
     manager: PulseManager,
-    strips: Vec<ChannelStrip>,
+    /// Channel strips currently shown, each paired with its channel id.
+    strips: RefCell<Vec<(u64, ChannelStrip)>>,
+    strips_box: gtk::Box,
+    add_button: gtk::MenuButton,
+    add_menu: gio::Menu,
     outputs: OutputsPanel,
     sidebar: Sidebar,
     stack: gtk::Stack,
     error_page: adw::StatusPage,
     save_pending: Cell<bool>,
     /// Per-channel edit counter used to debounce rename → sink rebuild.
-    rename_epoch: RefCell<Vec<u64>>,
+    rename_epoch: RefCell<HashMap<u64, u64>>,
 }
 
 pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let config = Rc::new(RefCell::new(Config::load()));
     let manager = PulseManager::new(config.clone());
-    let strips: Vec<ChannelStrip> = (0..CHANNEL_COUNT).map(|_| ChannelStrip::new()).collect();
     let outputs = OutputsPanel::new();
     let sidebar = Sidebar::new();
 
-    {
-        let cfg = config.borrow();
-        for (i, strip) in strips.iter().enumerate() {
-            strip.load_config(&cfg.channels[i]);
-        }
-        outputs.load_config(&cfg.master);
-    }
+    outputs.load_config(&config.borrow().master);
 
     // ---- Mixer page ----------------------------------------------------------
+    // Strips keep a fixed width; the row scrolls instead of stretching.
     let strips_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    strips_box.set_homogeneous(true);
-    for strip in &strips {
-        strips_box.append(&strip.root);
-    }
+    strips_box.set_halign(gtk::Align::Start);
     let strips_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .child(&strips_box)
         .vexpand(true)
         .build();
+
+    let add_menu = gio::Menu::new();
+    let add_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    add_content.set_valign(gtk::Align::Center);
+    let add_icon = gtk::Image::from_icon_name("list-add-symbolic");
+    add_icon.set_pixel_size(24);
+    add_content.append(&add_icon);
+    let add_label = gtk::Label::new(Some("Add Channel"));
+    add_label.add_css_class("dim-label");
+    add_content.append(&add_label);
+    let add_button = gtk::MenuButton::builder()
+        .child(&add_content)
+        .menu_model(&add_menu)
+        .tooltip_text("Add a channel")
+        .width_request(super::channel_strip::STRIP_WIDTH)
+        .build();
+    add_button.add_css_class("card");
+    add_button.add_css_class("flat");
 
     let mixer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -150,17 +164,19 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let app = Rc::new(App {
         config,
         manager,
-        strips,
+        strips: RefCell::new(Vec::new()),
+        strips_box,
+        add_button,
+        add_menu,
         outputs,
         sidebar,
         stack,
         error_page,
         save_pending: Cell::new(false),
-        rename_epoch: RefCell::new(vec![0; CHANNEL_COUNT]),
+        rename_epoch: RefCell::new(HashMap::new()),
     });
 
     wire_actions(&app, &window);
-    wire_strips(&app);
     wire_outputs(&app);
     wire_audio_events(&app);
     {
@@ -172,6 +188,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     }
     wire_close(&app, &window);
 
+    rebuild_strips(&app);
     app.manager.connect_server();
     window
 }
@@ -207,7 +224,13 @@ fn wire_audio_events(app: &Rc<App>) {
             }
             AudioEvent::DevicesChanged => refresh_devices(&app),
             AudioEvent::Level(target, v) => match target {
-                LevelTarget::Channel(i) => app.strips[i].level.set_value(v),
+                LevelTarget::Channel(id) => {
+                    if let Some((_, strip)) =
+                        app.strips.borrow().iter().find(|(cid, _)| *cid == id)
+                    {
+                        strip.level.set_value(v);
+                    }
+                }
                 LevelTarget::MonitorMix => app.outputs.monitor_level.set_value(v),
                 LevelTarget::StreamMix => app.outputs.stream_level.set_value(v),
             },
@@ -219,7 +242,10 @@ fn refresh_devices(app: &Rc<App>) {
     let sources = app.manager.sources();
     let apps = app.manager.app_names();
 
-    let mut items: Vec<(String, Option<Assignment>)> = vec![("No Input".to_string(), None)];
+    let mut items: Vec<(String, Option<Assignment>)> = vec![
+        ("No Input".to_string(), None),
+        ("Virtual Device".to_string(), Some(Assignment::Virtual)),
+    ];
     for s in sources.iter().filter(|s| !s.is_monitor) {
         items.push((
             s.description.clone(),
@@ -252,8 +278,10 @@ fn refresh_devices(app: &Rc<App>) {
 
     {
         let cfg = app.config.borrow();
-        for (i, strip) in app.strips.iter().enumerate() {
-            strip.set_input_entries(&items, &cfg.channels[i].assignment);
+        for (id, strip) in app.strips.borrow().iter() {
+            if let Some(ch) = cfg.channel(*id) {
+                strip.set_input_entries(&items, &ch.assignment);
+            }
         }
         app.outputs
             .set_output_sinks(&sink_items, &cfg.master.monitor_device);
@@ -281,152 +309,242 @@ fn update_sidebar(app: &Rc<App>) {
             .source_description(name)
             .unwrap_or_else(|| name.clone()),
         Assignment::App { name } => format!("{name} — application"),
+        Assignment::Virtual => "Virtual device".to_string(),
     });
 }
 
-// ---- User interaction wiring -------------------------------------------------
+// ---- Channel strips (dynamic) -------------------------------------------------
 
-fn wire_strips(app: &Rc<App>) {
-    for i in 0..CHANNEL_COUNT {
-        let strip = &app.strips[i];
+/// Recreate all channel strips from the config. Called on startup and after
+/// adding/removing a channel.
+fn rebuild_strips(app: &Rc<App>) {
+    while let Some(child) = app.strips_box.first_child() {
+        app.strips_box.remove(&child);
+    }
+    let channels = app.config.borrow().channels.clone();
+    let mut strips = Vec::with_capacity(channels.len());
+    for ch in &channels {
+        let strip = ChannelStrip::new();
+        strip.load_config(ch);
+        strip.remove.set_visible(!ch.permanent);
+        wire_strip(app, &strip, ch.id);
+        app.strips_box.append(&strip.root);
+        strips.push((ch.id, strip));
+    }
+    app.strips_box.append(&app.add_button);
+    app.add_button.set_visible(channels.len() < MAX_CHANNELS);
+    *app.strips.borrow_mut() = strips;
+    rebuild_add_menu(app);
+    refresh_devices(app);
+}
 
-        {
-            let app = app.clone();
-            strip.name.connect_changed(move |editable| {
-                if app.strips[i].guard.get() {
+fn rebuild_add_menu(app: &Rc<App>) {
+    app.add_menu.remove_all();
+    let templates = app.config.borrow().unused_template_names();
+    for name in templates {
+        app.add_menu
+            .append(Some(name), Some(&format!("win.add-channel('{name}')")));
+    }
+    app.add_menu
+        .append(Some("Custom Channel"), Some("win.add-channel('')"));
+}
+
+fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        strip.name.connect_changed(move |editable| {
+            if guard.get() {
+                return;
+            }
+            let text = editable.text().to_string();
+            {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
                     return;
-                }
-                app.config.borrow_mut().channels[i].name = editable.text().to_string();
-                schedule_save(&app);
-                update_sidebar(&app);
-                // App channels expose a device named after the channel;
-                // rebuild the channel sink once the user stops typing.
-                let epoch = {
-                    let mut epochs = app.rename_epoch.borrow_mut();
-                    epochs[i] += 1;
-                    epochs[i]
                 };
-                let app = app.clone();
-                glib::timeout_add_local_once(Duration::from_millis(900), move || {
-                    if app.rename_epoch.borrow()[i] != epoch {
-                        return;
-                    }
-                    let is_app_channel = matches!(
-                        app.config.borrow().channels[i].assignment,
-                        Some(Assignment::App { .. })
-                    );
-                    if is_app_channel {
-                        app.manager.rebuild_channel(i);
-                    }
-                });
-            });
-        }
-
-        {
+                ch.name = text;
+            }
+            schedule_save(&app);
+            update_sidebar(&app);
+            rebuild_add_menu(&app);
+            // Virtual/App channels expose a device named after the channel;
+            // rebuild the channel sink once the user stops typing.
+            let epoch = {
+                let mut epochs = app.rename_epoch.borrow_mut();
+                let e = epochs.entry(id).or_insert(0);
+                *e += 1;
+                *e
+            };
             let app = app.clone();
-            strip.input.connect_selected_notify(move |dd| {
-                if app.strips[i].guard.get() {
+            glib::timeout_add_local_once(Duration::from_millis(900), move || {
+                if app.rename_epoch.borrow().get(&id) != Some(&epoch) {
                     return;
                 }
-                let assignment = app.strips[i]
-                    .entries
-                    .borrow()
-                    .get(dd.selected() as usize)
-                    .cloned()
-                    .flatten();
-                {
-                    let mut cfg = app.config.borrow_mut();
-                    if cfg.channels[i].assignment == assignment {
-                        return;
-                    }
-                    cfg.channels[i].assignment = assignment;
+                let needs_sink = matches!(
+                    app.config.borrow().channel(id).and_then(|c| c.assignment.clone()),
+                    Some(Assignment::App { .. }) | Some(Assignment::Virtual)
+                );
+                if needs_sink {
+                    app.manager.rebuild_channel(id);
                 }
-                app.manager.rebuild_channel(i);
-                schedule_save(&app);
-                update_sidebar(&app);
             });
-        }
+        });
+    }
 
-        {
-            let app = app.clone();
-            strip.monitor_scale.connect_value_changed(move |scale| {
-                if app.strips[i].guard.get() {
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        let entries = strip.entries.clone();
+        strip.input.connect_selected_notify(move |dd| {
+            if guard.get() {
+                return;
+            }
+            let assignment = entries
+                .borrow()
+                .get(dd.selected() as usize)
+                .cloned()
+                .flatten();
+            {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
                     return;
-                }
-                let v = scale.value();
-                let linked = {
-                    let mut cfg = app.config.borrow_mut();
-                    cfg.channels[i].monitor_volume = v;
-                    cfg.channels[i].linked
                 };
-                app.manager.apply_channel_mix(i, Mix::Monitor);
-                if linked {
-                    app.strips[i].stream_scale.set_value(v);
-                }
-                schedule_save(&app);
-            });
-        }
-
-        {
-            let app = app.clone();
-            strip.stream_scale.connect_value_changed(move |scale| {
-                if app.strips[i].guard.get() {
+                if ch.assignment == assignment {
                     return;
                 }
-                let v = scale.value();
-                let linked = {
-                    let mut cfg = app.config.borrow_mut();
-                    cfg.channels[i].stream_volume = v;
-                    cfg.channels[i].linked
+                ch.assignment = assignment;
+            }
+            app.manager.rebuild_channel(id);
+            schedule_save(&app);
+            update_sidebar(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        let other = strip.stream_scale.clone();
+        strip.monitor_scale.connect_value_changed(move |scale| {
+            if guard.get() {
+                return;
+            }
+            let v = scale.value();
+            let linked = {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
+                    return;
                 };
-                app.manager.apply_channel_mix(i, Mix::Stream);
-                if linked {
-                    app.strips[i].monitor_scale.set_value(v);
-                }
-                schedule_save(&app);
-            });
-        }
+                ch.monitor_volume = v;
+                ch.linked
+            };
+            app.manager.apply_channel_mix(id, Mix::Monitor);
+            if linked {
+                other.set_value(v);
+            }
+            schedule_save(&app);
+        });
+    }
 
-        {
-            let app = app.clone();
-            strip.monitor_mute.connect_toggled(move |btn| {
-                if app.strips[i].guard.get() {
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        let other = strip.monitor_scale.clone();
+        strip.stream_scale.connect_value_changed(move |scale| {
+            if guard.get() {
+                return;
+            }
+            let v = scale.value();
+            let linked = {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
                     return;
-                }
-                app.config.borrow_mut().channels[i].monitor_muted = btn.is_active();
-                app.manager.apply_channel_mix(i, Mix::Monitor);
-                schedule_save(&app);
-            });
-        }
+                };
+                ch.stream_volume = v;
+                ch.linked
+            };
+            app.manager.apply_channel_mix(id, Mix::Stream);
+            if linked {
+                other.set_value(v);
+            }
+            schedule_save(&app);
+        });
+    }
 
-        {
-            let app = app.clone();
-            strip.stream_mute.connect_toggled(move |btn| {
-                if app.strips[i].guard.get() {
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        strip.monitor_mute.connect_toggled(move |btn| {
+            if guard.get() {
+                return;
+            }
+            {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
                     return;
-                }
-                app.config.borrow_mut().channels[i].stream_muted = btn.is_active();
-                app.manager.apply_channel_mix(i, Mix::Stream);
-                schedule_save(&app);
-            });
-        }
+                };
+                ch.monitor_muted = btn.is_active();
+            }
+            app.manager.apply_channel_mix(id, Mix::Monitor);
+            schedule_save(&app);
+        });
+    }
 
-        {
-            let app = app.clone();
-            strip.link.connect_toggled(move |btn| {
-                if app.strips[i].guard.get() {
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        strip.stream_mute.connect_toggled(move |btn| {
+            if guard.get() {
+                return;
+            }
+            {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
                     return;
-                }
-                app.config.borrow_mut().channels[i].linked = btn.is_active();
-                if btn.is_active() {
-                    let v = app.strips[i].monitor_scale.value();
-                    app.strips[i].stream_scale.set_value(v);
-                }
-                schedule_save(&app);
-            });
-        }
+                };
+                ch.stream_muted = btn.is_active();
+            }
+            app.manager.apply_channel_mix(id, Mix::Stream);
+            schedule_save(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        let monitor_scale = strip.monitor_scale.clone();
+        let stream_scale = strip.stream_scale.clone();
+        strip.link.connect_toggled(move |btn| {
+            if guard.get() {
+                return;
+            }
+            {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
+                    return;
+                };
+                ch.linked = btn.is_active();
+            }
+            if btn.is_active() {
+                stream_scale.set_value(monitor_scale.value());
+            }
+            schedule_save(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        strip.remove.connect_clicked(move |_| {
+            app.config.borrow_mut().remove_channel(id);
+            app.manager.rebuild_channel(id);
+            rebuild_strips(&app);
+            schedule_save(&app);
+            update_sidebar(&app);
+        });
     }
 }
+
+// ---- Outputs section -----------------------------------------------------------
 
 fn wire_outputs(app: &Rc<App>) {
     {
@@ -512,8 +630,26 @@ fn wire_outputs(app: &Rc<App>) {
     }
 }
 
+// ---- Window actions -------------------------------------------------------------
+
 fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
-    let _ = app;
+    let add = gio::SimpleAction::new("add-channel", Some(glib::VariantTy::STRING));
+    {
+        let app = app.clone();
+        add.connect_activate(move |_, param| {
+            let name = param.and_then(|v| v.str()).unwrap_or("");
+            let name = if name.is_empty() { None } else { Some(name) };
+            let id = app.config.borrow_mut().add_channel(name);
+            if let Some(id) = id {
+                app.manager.rebuild_channel(id);
+                rebuild_strips(&app);
+                schedule_save(&app);
+                update_sidebar(&app);
+            }
+        });
+    }
+    window.add_action(&add);
+
     let about = gio::SimpleAction::new("about", None);
     let win_weak = window.downgrade();
     about.connect_activate(move |_, _| {

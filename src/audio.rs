@@ -31,7 +31,7 @@ use pulse::sample::{Format, Spec};
 use pulse::stream::{FlagSet as StreamFlagSet, PeekResult, Stream};
 use pulse::volume::{ChannelVolumes, Volume};
 
-use crate::config::{Assignment, Config, CHANNEL_COUNT};
+use crate::config::{Assignment, Config};
 
 pub const MONITOR_SINK: &str = "OpenWave_Monitor";
 pub const STREAM_SINK: &str = "OpenWave_Stream";
@@ -40,8 +40,8 @@ const OWN_PREFIX: &str = "OpenWave_";
 const LOOPBACK_ARGS: &str = "latency_msec=30";
 const INVALID_INDEX: u32 = u32::MAX;
 
-fn channel_sink_name(ch: usize) -> String {
-    format!("{OWN_PREFIX}Ch{ch}")
+fn channel_sink_name(id: u64) -> String {
+    format!("{OWN_PREFIX}Ch{id}")
 }
 
 /// Strip characters that would break PulseAudio module argument quoting.
@@ -71,7 +71,7 @@ pub enum Mix {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LevelTarget {
-    Channel(usize),
+    Channel(u64),
     MonitorMix,
     StreamMix,
 }
@@ -141,7 +141,8 @@ struct Inner {
     sources: Vec<SourceEntry>,
     sink_inputs: HashMap<u32, SinkInputEntry>,
     default_sink: Option<String>,
-    channels: Vec<ChannelRuntime>,
+    /// Per-channel runtime state, keyed by the channel's stable config id.
+    channels: HashMap<u64, ChannelRuntime>,
     monitor_out: Loopback,
     monitor_out_generation: u64,
     monitor_out_pending: bool,
@@ -165,7 +166,6 @@ impl PulseManager {
     pub fn new(config: Rc<RefCell<Config>>) -> Self {
         let inner = Inner {
             config,
-            channels: (0..CHANNEL_COUNT).map(|_| ChannelRuntime::default()).collect(),
             ..Inner::default()
         };
         Self {
@@ -185,7 +185,7 @@ impl PulseManager {
             inner.ready = false;
             inner.shutting_down = false;
             inner.owned_modules.clear();
-            inner.channels = (0..CHANNEL_COUNT).map(|_| ChannelRuntime::default()).collect();
+            inner.channels.clear();
             inner.monitor_out = Loopback::default();
             inner.monitor_out_pending = false;
             for (_, s) in inner.peaks.drain() {
@@ -229,12 +229,13 @@ impl PulseManager {
     // ---- Public reconcilers driven by the UI --------------------------------
 
     /// Tear down and recreate the routing for one channel from its config.
-    pub fn rebuild_channel(&self, ch: usize) {
-        Self::rebuild_channel_inner(&self.inner, ch);
+    /// If the channel no longer exists in the config, this just tears it down.
+    pub fn rebuild_channel(&self, id: u64) {
+        Self::rebuild_channel_inner(&self.inner, id);
     }
 
-    pub fn apply_channel_mix(&self, ch: usize, mix: Mix) {
-        Self::apply_channel_mix_inner(&self.inner, ch, mix);
+    pub fn apply_channel_mix(&self, id: u64, mix: Mix) {
+        Self::apply_channel_mix_inner(&self.inner, id, mix);
     }
 
     pub fn apply_master_monitor(&self) {
@@ -242,8 +243,13 @@ impl PulseManager {
     }
 
     pub fn apply_master_stream(&self) {
-        for ch in 0..CHANNEL_COUNT {
-            Self::apply_channel_mix_inner(&self.inner, ch, Mix::Stream);
+        let ids: Vec<u64> = {
+            let inner = self.inner.borrow();
+            let cfg = inner.config.borrow();
+            cfg.channels.iter().map(|c| c.id).collect()
+        };
+        for id in ids {
+            Self::apply_channel_mix_inner(&self.inner, id, Mix::Stream);
         }
     }
 
@@ -490,8 +496,13 @@ impl PulseManager {
         }
         Self::emit(rc, AudioEvent::Ready);
         Self::create_stream_mic(rc);
-        for ch in 0..CHANNEL_COUNT {
-            Self::rebuild_channel_inner(rc, ch);
+        let ids: Vec<u64> = {
+            let inner = rc.borrow();
+            let cfg = inner.config.borrow();
+            cfg.channels.iter().map(|c| c.id).collect()
+        };
+        for id in ids {
+            Self::rebuild_channel_inner(rc, id);
         }
         Self::create_peak(rc, LevelTarget::MonitorMix, &format!("{MONITOR_SINK}.monitor"));
         Self::create_peak(rc, LevelTarget::StreamMix, &format!("{STREAM_SINK}.monitor"));
@@ -664,7 +675,7 @@ impl PulseManager {
     /// after creation; re-checking on every sink-input refresh converges
     /// back to our state because we only write on mismatch.
     fn match_pending_loopbacks(rc: &Rc<RefCell<Inner>>) {
-        let mut applies: Vec<(Option<usize>, Mix)> = Vec::new();
+        let mut applies: Vec<(Option<u64>, Mix)> = Vec::new();
         let mut moves: Vec<(u32, String)> = Vec::new();
         {
             let mut inner = rc.borrow_mut();
@@ -673,11 +684,15 @@ impl PulseManager {
                 .values()
                 .filter_map(|e| e.owner_module.map(|m| (m, (e.index, e.channels))))
                 .collect();
-            for ch in 0..CHANNEL_COUNT {
+            let ids: Vec<u64> = inner.channels.keys().copied().collect();
+            for &id in &ids {
                 for mix in [Mix::Monitor, Mix::Stream] {
+                    let Some(rt) = inner.channels.get_mut(&id) else {
+                        continue;
+                    };
                     let l = match mix {
-                        Mix::Monitor => &mut inner.channels[ch].monitor_loop,
-                        Mix::Stream => &mut inner.channels[ch].stream_loop,
+                        Mix::Monitor => &mut rt.monitor_loop,
+                        Mix::Stream => &mut rt.stream_loop,
                     };
                     if let (Some(m), None) = (l.module, l.sink_input) {
                         if let Some(&(si, chans)) = by_module.get(&m) {
@@ -704,12 +719,14 @@ impl PulseManager {
                 .iter()
                 .map(|(i, e)| (*i, e.name.as_str()))
                 .collect();
-            for ch in 0..CHANNEL_COUNT {
-                let c = &cfg.channels[ch];
+            for c in &cfg.channels {
+                let Some(rt) = inner.channels.get(&c.id) else {
+                    continue;
+                };
                 for mix in [Mix::Monitor, Mix::Stream] {
                     let l = match mix {
-                        Mix::Monitor => &inner.channels[ch].monitor_loop,
-                        Mix::Stream => &inner.channels[ch].stream_loop,
+                        Mix::Monitor => &rt.monitor_loop,
+                        Mix::Stream => &rt.stream_loop,
                     };
                     let (vol, mute) = match mix {
                         Mix::Monitor => (c.monitor_volume, c.monitor_muted),
@@ -719,7 +736,7 @@ impl PulseManager {
                         ),
                     };
                     Self::check_drift(&inner, l, vol, mute, &sink_names, &mut moves)
-                        .then(|| applies.push((Some(ch), mix)));
+                        .then(|| applies.push((Some(c.id), mix)));
                 }
             }
             if Self::check_drift(
@@ -740,9 +757,9 @@ impl PulseManager {
                 }
             }
         }
-        for (ch, mix) in applies {
-            match ch {
-                Some(c) => Self::apply_channel_mix_inner(rc, c, mix),
+        for (id, mix) in applies {
+            match id {
+                Some(id) => Self::apply_channel_mix_inner(rc, id, mix),
                 None => Self::apply_master_monitor_inner(rc),
             }
         }
@@ -785,14 +802,19 @@ impl PulseManager {
                 .map(|(i, e)| (*i, e.name.as_str()))
                 .collect();
             let mut moves = Vec::new();
-            for ch in 0..CHANNEL_COUNT {
-                let Some(Assignment::App { name }) = &cfg.channels[ch].assignment else {
+            for c in &cfg.channels {
+                let Some(Assignment::App { name }) = &c.assignment else {
                     continue;
                 };
-                if inner.channels[ch].sink_module.is_none() {
+                if inner
+                    .channels
+                    .get(&c.id)
+                    .and_then(|rt| rt.sink_module)
+                    .is_none()
+                {
                     continue;
                 }
-                let target = channel_sink_name(ch);
+                let target = channel_sink_name(c.id);
                 if !inner.sinks.iter().any(|(_, e)| e.name == target) {
                     continue;
                 }
@@ -823,10 +845,10 @@ impl PulseManager {
         }
     }
 
-    fn rebuild_channel_inner(rc: &Rc<RefCell<Inner>>, ch: usize) {
-        let (assignment, generation_id, to_unload, active) = {
+    fn rebuild_channel_inner(rc: &Rc<RefCell<Inner>>, id: u64) {
+        let (channel_cfg, generation_id, to_unload, active) = {
             let mut inner = rc.borrow_mut();
-            let rt = &mut inner.channels[ch];
+            let rt = inner.channels.entry(id).or_default();
             rt.generation += 1;
             let generation_id = rt.generation;
             let mut to_unload = Vec::new();
@@ -844,14 +866,23 @@ impl PulseManager {
             for m in &to_unload {
                 inner.owned_modules.remove(m);
             }
-            if let Some(s) = inner.peaks.remove(&LevelTarget::Channel(ch)) {
+            if let Some(s) = inner.peaks.remove(&LevelTarget::Channel(id)) {
                 let _ = s.borrow_mut().disconnect();
             }
-            let assignment = inner.config.borrow().channels[ch].assignment.clone();
+            let channel_cfg = inner
+                .config
+                .borrow()
+                .channel(id)
+                .map(|c| (c.assignment.clone(), c.name.clone()));
+            if channel_cfg.is_none() {
+                // Channel was removed; stale module callbacks detect the
+                // missing runtime entry and clean up after themselves.
+                inner.channels.remove(&id);
+            }
             let active = inner.ready && !inner.shutting_down;
-            (assignment, generation_id, to_unload, active)
+            (channel_cfg, generation_id, to_unload, active)
         };
-        Self::emit(rc, AudioEvent::Level(LevelTarget::Channel(ch), 0.0));
+        Self::emit(rc, AudioEvent::Level(LevelTarget::Channel(id), 0.0));
         if let Some(mut intro) = Self::introspect(rc) {
             for m in to_unload {
                 let _ = intro.unload_module(m, |_| {});
@@ -860,23 +891,26 @@ impl PulseManager {
         if !active {
             return;
         }
+        let Some((assignment, channel_name)) = channel_cfg else {
+            return;
+        };
         match assignment {
             None => {}
             Some(Assignment::Source { name }) => {
-                Self::create_channel_loopbacks(rc, ch, generation_id, &name);
-                Self::create_peak(rc, LevelTarget::Channel(ch), &name);
+                Self::create_channel_loopbacks(rc, id, generation_id, &name);
+                Self::create_peak(rc, LevelTarget::Channel(id), &name);
             }
-            Some(Assignment::App { .. }) => {
-                let sink_name = channel_sink_name(ch);
-                let desc = {
-                    let inner = rc.borrow();
-                    let cfg = inner.config.borrow();
-                    let name = sanitize_desc(cfg.channels[ch].name.trim());
-                    if name.is_empty() {
-                        format!("OpenWave Channel {}", ch + 1)
-                    } else {
-                        format!("OpenWave: {name}")
-                    }
+            // App channels and standalone virtual channels both expose a
+            // selectable device named after the channel; apps can be routed
+            // into it from OpenWave (App) or from the app's own output
+            // device picker / OBS audio capture (both).
+            Some(Assignment::App { .. }) | Some(Assignment::Virtual) => {
+                let sink_name = channel_sink_name(id);
+                let clean = sanitize_desc(channel_name.trim());
+                let desc = if clean.is_empty() {
+                    format!("OpenWave Channel {id}")
+                } else {
+                    format!("OpenWave: {clean}")
                 };
                 let args = format!(
                     "sink_name={sink_name} sink_properties='device.description=\"{desc}\"'"
@@ -894,7 +928,11 @@ impl PulseManager {
                     }
                     let stale = {
                         let inner = rc.borrow();
-                        inner.channels[ch].generation != generation_id || inner.shutting_down
+                        inner
+                            .channels
+                            .get(&id)
+                            .is_none_or(|rt| rt.generation != generation_id)
+                            || inner.shutting_down
                     };
                     if stale {
                         if let Some(mut intro) = Self::introspect(&rc) {
@@ -905,18 +943,20 @@ impl PulseManager {
                     {
                         let mut inner = rc.borrow_mut();
                         inner.owned_modules.insert(idx);
-                        inner.channels[ch].sink_module = Some(idx);
+                        if let Some(rt) = inner.channels.get_mut(&id) {
+                            rt.sink_module = Some(idx);
+                        }
                     }
                     let monitor = format!("{sink_name}.monitor");
-                    Self::create_channel_loopbacks(&rc, ch, generation_id, &monitor);
-                    Self::create_peak(&rc, LevelTarget::Channel(ch), &monitor);
+                    Self::create_channel_loopbacks(&rc, id, generation_id, &monitor);
+                    Self::create_peak(&rc, LevelTarget::Channel(id), &monitor);
                     Self::schedule_refresh(&rc);
                 });
             }
         }
     }
 
-    fn create_channel_loopbacks(rc: &Rc<RefCell<Inner>>, ch: usize, generation_id: u64, source: &str) {
+    fn create_channel_loopbacks(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64, source: &str) {
         let Some(mut intro) = Self::introspect(rc) else {
             return;
         };
@@ -926,7 +966,7 @@ impl PulseManager {
                 Mix::Stream => STREAM_SINK,
             };
             let tag = format!(
-                "OpenWave ch{ch} {}",
+                "OpenWave ch{id} {}",
                 match mix {
                     Mix::Monitor => "monitor",
                     Mix::Stream => "stream",
@@ -943,7 +983,11 @@ impl PulseManager {
                 }
                 let stale = {
                     let inner = rc.borrow();
-                    inner.channels[ch].generation != generation_id || inner.shutting_down
+                    inner
+                        .channels
+                        .get(&id)
+                        .is_none_or(|rt| rt.generation != generation_id)
+                        || inner.shutting_down
                 };
                 if stale {
                     if let Some(mut intro) = Self::introspect(&rc) {
@@ -954,13 +998,15 @@ impl PulseManager {
                 {
                     let mut inner = rc.borrow_mut();
                     inner.owned_modules.insert(idx);
-                    let l = match mix {
-                        Mix::Monitor => &mut inner.channels[ch].monitor_loop,
-                        Mix::Stream => &mut inner.channels[ch].stream_loop,
-                    };
-                    l.module = Some(idx);
-                    l.sink_input = None;
-                    l.target = sink.to_string();
+                    if let Some(rt) = inner.channels.get_mut(&id) {
+                        let l = match mix {
+                            Mix::Monitor => &mut rt.monitor_loop,
+                            Mix::Stream => &mut rt.stream_loop,
+                        };
+                        l.module = Some(idx);
+                        l.sink_input = None;
+                        l.target = sink.to_string();
+                    }
                 }
                 Self::schedule_refresh(&rc);
             });
@@ -1035,14 +1081,19 @@ impl PulseManager {
         });
     }
 
-    fn apply_channel_mix_inner(rc: &Rc<RefCell<Inner>>, ch: usize, mix: Mix) {
+    fn apply_channel_mix_inner(rc: &Rc<RefCell<Inner>>, id: u64, mix: Mix) {
         let params = {
             let inner = rc.borrow();
             let cfg = inner.config.borrow();
-            let c = &cfg.channels[ch];
+            let Some(c) = cfg.channel(id) else {
+                return;
+            };
+            let Some(rt) = inner.channels.get(&id) else {
+                return;
+            };
             let l = match mix {
-                Mix::Monitor => &inner.channels[ch].monitor_loop,
-                Mix::Stream => &inner.channels[ch].stream_loop,
+                Mix::Monitor => &rt.monitor_loop,
+                Mix::Stream => &rt.stream_loop,
             };
             l.sink_input.map(|si| {
                 let (vol, mute) = match mix {

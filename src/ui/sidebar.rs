@@ -1,14 +1,17 @@
+use std::cell::RefCell;
+
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::config::{Assignment, Config, CHANNEL_COUNT};
+use crate::config::{Assignment, Config};
 
 /// Sidebar summarizing the virtual devices and what feeds each channel.
 pub struct Sidebar {
     pub root: gtk::ScrolledWindow,
     monitor_row: adw::ActionRow,
     stream_row: adw::ActionRow,
-    channel_rows: Vec<adw::ActionRow>,
+    channels_group: adw::PreferencesGroup,
+    channel_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
 impl Sidebar {
@@ -34,13 +37,6 @@ impl Sidebar {
         let channels_group = adw::PreferencesGroup::builder()
             .title("Channel Assignments")
             .build();
-        let channel_rows: Vec<adw::ActionRow> = (0..CHANNEL_COUNT)
-            .map(|_| {
-                let row = adw::ActionRow::builder().subtitle("No input").build();
-                channels_group.add(&row);
-                row
-            })
-            .collect();
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -62,7 +58,8 @@ impl Sidebar {
             root,
             monitor_row,
             stream_row,
-            channel_rows,
+            channels_group,
+            channel_rows: RefCell::new(Vec::new()),
         }
     }
 
@@ -75,14 +72,27 @@ impl Sidebar {
         self.monitor_row
             .set_subtitle(&format!("Routed to {monitor_device_label}"));
         let _ = &self.stream_row;
-        for (i, row) in self.channel_rows.iter().enumerate() {
-            let ch = &config.channels[i];
+
+        let mut rows = self.channel_rows.borrow_mut();
+        while rows.len() > config.channels.len() {
+            if let Some(row) = rows.pop() {
+                self.channels_group.remove(&row);
+            }
+        }
+        while rows.len() < config.channels.len() {
+            let row = adw::ActionRow::new();
+            self.channels_group.add(&row);
+            rows.push(row);
+        }
+        for (row, ch) in rows.iter().zip(&config.channels) {
             row.set_title(&glib::markup_escape_text(&ch.name));
-            let subtitle = ch
-                .assignment
-                .as_ref()
-                .map(describe)
-                .unwrap_or_else(|| "No input".to_string());
+            let subtitle = match &ch.assignment {
+                None => "No input".to_string(),
+                Some(Assignment::Virtual) => {
+                    format!("Virtual device — “OpenWave: {}”", ch.name)
+                }
+                Some(a) => describe(a),
+            };
             row.set_subtitle(&glib::markup_escape_text(&subtitle));
         }
     }

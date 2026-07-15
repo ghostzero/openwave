@@ -7,12 +7,16 @@ use crate::config::{Assignment, ChannelConfig};
 
 use super::{label_factory, meter_bar, mute_button};
 
+/// Fixed width of every channel strip (and the add-channel card).
+pub const STRIP_WIDTH: i32 = 150;
+
 /// One vertical input strip: rename label, input selector, level meter and the
 /// two independent faders (monitor mix left, stream mix right) with per-mix
 /// mute buttons and an optional fader link.
 pub struct ChannelStrip {
     pub root: gtk::Box,
     pub name: gtk::EditableLabel,
+    pub remove: gtk::Button,
     pub input: gtk::DropDown,
     pub level: gtk::LevelBar,
     pub monitor_scale: gtk::Scale,
@@ -23,8 +27,9 @@ pub struct ChannelStrip {
     /// Set while the strip is being updated programmatically so signal
     /// handlers know not to write back into the config.
     pub guard: Rc<Cell<bool>>,
-    /// Assignment behind each drop-down position (index-aligned with the model).
-    pub entries: RefCell<Vec<Option<Assignment>>>,
+    /// Assignment behind each drop-down position (index-aligned with the
+    /// model). Shared with the selection handler.
+    pub entries: Rc<RefCell<Vec<Option<Assignment>>>>,
     last_labels: RefCell<Vec<String>>,
 }
 
@@ -55,15 +60,30 @@ impl ChannelStrip {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(10)
+            .width_request(STRIP_WIDTH)
             .css_classes(["card", "channel-strip"])
             .build();
 
         let name = gtk::EditableLabel::builder()
             .text("")
             .xalign(0.5)
+            .hexpand(true)
+            .max_width_chars(12)
             .tooltip_text("Rename channel")
             .build();
         name.add_css_class("heading");
+
+        let remove = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Remove channel")
+            .valign(gtk::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        remove.add_css_class("circular");
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        header.append(&name);
+        header.append(&remove);
 
         let input = gtk::DropDown::builder()
             .tooltip_text("Select the input for this channel")
@@ -95,7 +115,7 @@ impl ChannelStrip {
         faders.append(&link);
         faders.append(&fader_column(&stream_scale, &stream_mute, "Stream"));
 
-        root.append(&name);
+        root.append(&header);
         root.append(&input);
         root.append(&level);
         root.append(&faders);
@@ -103,6 +123,7 @@ impl ChannelStrip {
         Self {
             root,
             name,
+            remove,
             input,
             level,
             monitor_scale,
@@ -111,7 +132,7 @@ impl ChannelStrip {
             stream_mute,
             link,
             guard: Rc::new(Cell::new(false)),
-            entries: RefCell::new(Vec::new()),
+            entries: Rc::new(RefCell::new(Vec::new())),
             last_labels: RefCell::new(Vec::new()),
         }
     }
@@ -145,6 +166,7 @@ impl ChannelStrip {
                 let label = match a {
                     Assignment::Source { name } => format!("{name} (unavailable)"),
                     Assignment::App { name } => format!("{name} (not running)"),
+                    Assignment::Virtual => "Virtual Device".to_string(),
                 };
                 labels.push(label);
                 assigns.push(Some(a.clone()));
