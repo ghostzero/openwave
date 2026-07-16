@@ -356,11 +356,10 @@ fn rebuild_strips(app: &Rc<App>) {
         let strip = ChannelStrip::new();
         strip.load_config(ch);
         if ch.permanent {
-            // Keep the button allocated so permanent strips get the exact
-            // same header layout as removable ones.
-            strip.remove.set_opacity(0.0);
+            // Shown but disabled: permanent strips keep the exact same
+            // header layout as removable ones.
             strip.remove.set_sensitive(false);
-            strip.remove.set_tooltip_text(None);
+            strip.remove.set_tooltip_text(Some("Built-in channels cannot be removed"));
         }
         wire_strip(app, &strip, ch.id);
         app.strips_box.append(&strip.root);

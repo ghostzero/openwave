@@ -14,6 +14,13 @@ use gtk::glib;
 pub const APP_ID: &str = "de.ghostzero.OpenWave";
 
 fn main() -> glib::ExitCode {
+    // Bundled resources (symbolic icons not shipped by system themes).
+    let resources = gtk::gio::Resource::from_data(&glib::Bytes::from_static(
+        include_bytes!(concat!(env!("OUT_DIR"), "/openwave.gresource")),
+    ))
+    .expect("embedded gresource is valid");
+    gtk::gio::resources_register(&resources);
+
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.add_main_option(
         "hidden",

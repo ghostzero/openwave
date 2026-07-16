@@ -75,7 +75,7 @@ impl ChannelStrip {
         name.add_css_class("heading");
 
         let remove = gtk::Button::builder()
-            .icon_name("window-close-symbolic")
+            .icon_name("user-trash-symbolic")
             .tooltip_text("Remove channel")
             .valign(gtk::Align::Center)
             .build();
@@ -83,7 +83,7 @@ impl ChannelStrip {
         remove.add_css_class("circular");
 
         let fx = gtk::Button::builder()
-            .icon_name("application-x-addon-symbolic")
+            .icon_name("sound-symbolic")
             .tooltip_text("Effects")
             .valign(gtk::Align::Center)
             .build();
