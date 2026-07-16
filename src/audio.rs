@@ -90,7 +90,8 @@ pub enum AudioEvent {
     Ready,
     Failed(String),
     DevicesChanged,
-    Level(LevelTarget, f64),
+    /// Peak levels per channel (one entry for mono, two for stereo).
+    Level(LevelTarget, Vec<f64>),
     /// A channel's VST rack finished (re)loading; parameter info changed.
     VstChanged(u64),
     /// VST parameters were edited from a plugin's own window and written
@@ -1162,7 +1163,7 @@ impl PulseManager {
             let active = inner.ready && !inner.shutting_down;
             (channel_cfg, generation_id, to_unload, active)
         };
-        Self::emit(rc, AudioEvent::Level(LevelTarget::Channel(id), 0.0));
+        Self::emit(rc, AudioEvent::Level(LevelTarget::Channel(id), vec![0.0]));
         if let Some(mut intro) = Self::introspect(rc) {
             for m in to_unload {
                 let _ = intro.unload_module(m, |_| {});
@@ -1684,8 +1685,31 @@ impl PulseManager {
     }
 
     /// Attach a low-rate peak-detect record stream (the pavucontrol trick) to
-    /// `source` and forward its levels as events.
+    /// `source` and forward its levels as events. The source's channel count
+    /// is looked up first so stereo inputs are metered per channel — a mono
+    /// peek stream would average the channels and under-read panned signals.
     fn create_peak(rc: &Rc<RefCell<Inner>>, target: LevelTarget, source: &str) {
+        let Some(intro) = Self::introspect(rc) else {
+            return;
+        };
+        let weak = Rc::downgrade(rc);
+        let source_owned = source.to_string();
+        intro.get_source_info_by_name(source, move |res| {
+            if let ListResult::Item(info) = res {
+                let channels = info.sample_spec.channels.clamp(1, 2);
+                if let Some(rc) = weak.upgrade() {
+                    Self::create_peak_stream(&rc, target, &source_owned, channels);
+                }
+            }
+        });
+    }
+
+    fn create_peak_stream(
+        rc: &Rc<RefCell<Inner>>,
+        target: LevelTarget,
+        source: &str,
+        channels: u8,
+    ) {
         let stream = {
             let mut inner = rc.borrow_mut();
             if !inner.ready || inner.shutting_down {
@@ -1699,7 +1723,7 @@ impl PulseManager {
             };
             let spec = Spec {
                 format: Format::FLOAT32NE,
-                channels: 1,
+                channels,
                 rate: 25,
             };
             // Unique media.name per meter plus restore opt-outs; otherwise
@@ -1728,18 +1752,21 @@ impl PulseManager {
                 let Some(s) = weak_stream.upgrade() else {
                     return;
                 };
-                let mut peak: f32 = 0.0;
+                let n = usize::from(channels);
+                let mut peaks = [0.0f32; 2];
                 let mut got_data = false;
                 {
                     let mut st = s.borrow_mut();
                     loop {
                         match st.peek() {
                             Ok(PeekResult::Data(data)) => {
-                                for chunk in data.chunks_exact(4) {
-                                    let v =
-                                        f32::from_ne_bytes(chunk.try_into().unwrap()).abs();
-                                    if v > peak {
-                                        peak = v;
+                                for frame in data.chunks_exact(4 * n) {
+                                    for (i, chunk) in frame.chunks_exact(4).enumerate() {
+                                        let v = f32::from_ne_bytes(chunk.try_into().unwrap())
+                                            .abs();
+                                        if v > peaks[i] {
+                                            peaks[i] = v;
+                                        }
                                     }
                                 }
                                 got_data = true;
@@ -1755,10 +1782,11 @@ impl PulseManager {
                 }
                 if got_data
                     && let Some(rc) = weak_inner.upgrade() {
-                        Self::emit(
-                            &rc,
-                            AudioEvent::Level(target, f64::from(peak.clamp(0.0, 1.0))),
-                        );
+                        let levels = peaks[..n]
+                            .iter()
+                            .map(|p| f64::from(p.clamp(0.0, 1.0)))
+                            .collect();
+                        Self::emit(&rc, AudioEvent::Level(target, levels));
                     }
             })));
         let attr = BufferAttr {
@@ -1766,7 +1794,7 @@ impl PulseManager {
             tlength: u32::MAX,
             prebuf: u32::MAX,
             minreq: u32::MAX,
-            fragsize: 4,
+            fragsize: 4 * u32::from(channels),
         };
         let ok = stream
             .borrow_mut()

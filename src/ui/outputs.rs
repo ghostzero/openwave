@@ -5,7 +5,7 @@ use adw::prelude::*;
 
 use crate::config::MasterConfig;
 
-use super::{label_factory, meter_bar, mute_button};
+use super::{label_factory, meter_pair, mute_button, MeterPair};
 
 /// The OUTPUTS section: one row for the monitor mix (with hardware device
 /// selector) and one for the stream mix, each with level meter, master volume
@@ -13,10 +13,10 @@ use super::{label_factory, meter_bar, mute_button};
 pub struct OutputsPanel {
     pub root: gtk::ListBox,
     pub monitor_device: gtk::DropDown,
-    pub monitor_level: gtk::LevelBar,
+    pub monitor_level: MeterPair,
     pub monitor_scale: gtk::Scale,
     pub monitor_mute: gtk::ToggleButton,
-    pub stream_level: gtk::LevelBar,
+    pub stream_level: MeterPair,
     pub stream_scale: gtk::Scale,
     pub stream_mute: gtk::ToggleButton,
     pub guard: Rc<Cell<bool>>,
@@ -42,7 +42,7 @@ fn output_row(
     title: &str,
     subtitle: &str,
     middle: &gtk::Widget,
-    level: &gtk::LevelBar,
+    level: &gtk::Box,
     scale: &gtk::Scale,
     mute: &gtk::ToggleButton,
     titles_group: &gtk::SizeGroup,
@@ -114,7 +114,7 @@ impl OutputsPanel {
 
         let titles_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
-        let monitor_level = meter_bar();
+        let monitor_level = meter_pair();
         let monitor_scale = master_scale("Monitor mix master volume");
         let monitor_mute = mute_button("audio-headphones-symbolic", "Mute the monitor mix");
         let monitor_row = output_row(
@@ -122,13 +122,13 @@ impl OutputsPanel {
             "Monitor Mix",
             "What you hear locally",
             monitor_device.upcast_ref(),
-            &monitor_level,
+            &monitor_level.root,
             &monitor_scale,
             &monitor_mute,
             &titles_group,
         );
 
-        let stream_level = meter_bar();
+        let stream_level = meter_pair();
         let stream_scale = master_scale("Stream mix master volume");
         let stream_mute = mute_button("media-record-symbolic", "Mute the stream mix");
         let stream_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -137,7 +137,7 @@ impl OutputsPanel {
             "Stream Mix",
             "Select “Virtual Stream Mix” as microphone in OBS, Discord, etc.",
             stream_spacer.upcast_ref(),
-            &stream_level,
+            &stream_level.root,
             &stream_scale,
             &stream_mute,
             &titles_group,

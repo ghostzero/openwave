@@ -295,11 +295,11 @@ fn wire_audio_events(app: &Rc<App>) {
                     if let Some((_, strip)) =
                         app.strips.borrow().iter().find(|(cid, _)| *cid == id)
                     {
-                        strip.level.set_value(v);
+                        strip.set_levels(&v);
                     }
                 }
-                LevelTarget::MonitorMix => app.outputs.monitor_level.set_value(v),
-                LevelTarget::StreamMix => app.outputs.stream_level.set_value(v),
+                LevelTarget::MonitorMix => app.outputs.monitor_level.set_levels(&v),
+                LevelTarget::StreamMix => app.outputs.stream_level.set_levels(&v),
             },
             AudioEvent::VstChanged(id) => {
                 let hooks = app
