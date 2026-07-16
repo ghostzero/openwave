@@ -87,6 +87,9 @@ pub enum AudioEvent {
     Level(LevelTarget, f64),
     /// A channel's VST rack finished (re)loading; parameter info changed.
     VstChanged(u64),
+    /// VST parameters were edited from a plugin's own window and written
+    /// into the config; it should be persisted.
+    VstParams(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -208,8 +211,24 @@ impl PulseManager {
                     Self::emit(&rc, AudioEvent::DevicesChanged);
                 }
                 FxEvent::VstReply(id, line) => {
-                    let changed = rc.borrow_mut().fx.handle_vst_reply(id, &line);
-                    if changed {
+                    let outcome = rc.borrow_mut().fx.handle_vst_reply(id, &line);
+                    if !outcome.params.is_empty() {
+                        // Edits made in a plugin's native window: persist
+                        // them like slider changes.
+                        let inner = rc.borrow();
+                        let mut cfg = inner.config.borrow_mut();
+                        if let Some(ch) = cfg.channel_mut(id) {
+                            for (cfg_id, index, value) in &outcome.params {
+                                if let Some(p) = ch.vst_mut(*cfg_id) {
+                                    p.params.insert(index.to_string(), *value);
+                                }
+                            }
+                        }
+                        drop(cfg);
+                        drop(inner);
+                        Self::emit(&rc, AudioEvent::VstParams(id));
+                    }
+                    if outcome.structure_changed {
                         Self::emit(&rc, AudioEvent::VstChanged(id));
                     }
                 }
@@ -333,6 +352,11 @@ impl PulseManager {
             .borrow_mut()
             .fx
             .set_vst_param(channel, cfg_id, index, value);
+    }
+
+    /// Open a VST plugin's own editor window (hosted by the helper).
+    pub fn show_vst_ui(&self, channel: u64, cfg_id: u64) {
+        self.inner.borrow_mut().fx.show_vst_ui(channel, cfg_id, true);
     }
 
     /// Unload everything we created on the server, then call `done`.

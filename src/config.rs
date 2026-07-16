@@ -63,6 +63,8 @@ pub struct VstPluginConfig {
     pub format: crate::vst::VstFormat,
     /// Sub-plugin label inside a multi-plugin bundle (VST3); empty otherwise.
     pub label: String,
+    /// Sub-plugin selector for multi-plugin binaries (0 = whole file).
+    pub unique_id: i64,
     /// Display name (cached from discovery).
     pub name: String,
     pub enabled: bool,
@@ -78,6 +80,7 @@ impl Default for VstPluginConfig {
             path: String::new(),
             format: crate::vst::VstFormat::Vst2,
             label: String::new(),
+            unique_id: 0,
             name: String::new(),
             enabled: true,
             params: BTreeMap::new(),
@@ -171,6 +174,7 @@ impl ChannelConfig {
             path: entry.path.clone(),
             format: entry.format,
             label: entry.label.clone(),
+            unique_id: entry.unique_id,
             name: entry.name.clone(),
             ..VstPluginConfig::default()
         });

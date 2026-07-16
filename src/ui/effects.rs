@@ -473,8 +473,27 @@ fn build_vst_group(state: &Rc<DialogState>) -> adw::PreferencesGroup {
         }
         row.add_prefix(&enable);
 
+        let runtime_entry = runtime.iter().find(|r| r.cfg_id == plugin.id);
+
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         buttons.set_valign(gtk::Align::Center);
+        if plugin.enabled
+            && runtime_entry
+                .is_some_and(|rt| matches!(rt.state, VstState::Loaded) && rt.has_ui)
+        {
+            let ui_btn = gtk::Button::builder()
+                .icon_name("window-new-symbolic")
+                .tooltip_text("Open the plugin's own window")
+                .valign(gtk::Align::Center)
+                .build();
+            ui_btn.add_css_class("flat");
+            let state = state.clone();
+            let vst_id = plugin.id;
+            ui_btn.connect_clicked(move |_| {
+                state.deps.manager.show_vst_ui(state.channel_id, vst_id);
+            });
+            buttons.append(&ui_btn);
+        }
         for (icon, tip, delta) in [
             ("go-up-symbolic", "Move up", -1i32),
             ("go-down-symbolic", "Move down", 1),
@@ -522,7 +541,7 @@ fn build_vst_group(state: &Rc<DialogState>) -> adw::PreferencesGroup {
             row.set_subtitle("Bypassed");
             row.set_enable_expansion(false);
         } else {
-            match runtime.iter().find(|r| r.cfg_id == plugin.id) {
+            match runtime_entry {
                 Some(rt) => match &rt.state {
                     VstState::Loaded => {
                         if rt.params.is_empty() {

@@ -40,6 +40,9 @@ pub struct VstEntry {
     pub format: VstFormat,
     /// Sub-plugin label inside the binary; empty for plain VST2 files.
     pub label: String,
+    /// Carla selects sub-plugins in multi-plugin binaries (VST3 bundles,
+    /// VST2 shells) by this id, not by label.
+    pub unique_id: i64,
     pub name: String,
     pub audio_ins: u32,
     pub audio_outs: u32,
@@ -52,7 +55,8 @@ struct CacheFile {
 }
 
 fn cache_path() -> PathBuf {
-    glib::user_cache_dir().join("openwave").join("vst-scan.json")
+    // v2: entries carry unique_id.
+    glib::user_cache_dir().join("openwave").join("vst-scan-v2.json")
 }
 
 fn discovery_tool() -> Option<PathBuf> {
@@ -186,6 +190,10 @@ fn discover(tool: &Path, path: &str, format: VstFormat) -> Vec<VstEntry> {
                 if in_block {
                     let name = current.get("name").cloned().unwrap_or_default();
                     let label = current.get("label").cloned().unwrap_or_default();
+                    let unique_id: i64 = current
+                        .get("uniqueId")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
                     let ains: u32 = current
                         .get("audio.ins")
                         .and_then(|v| v.parse().ok())
@@ -198,6 +206,7 @@ fn discover(tool: &Path, path: &str, format: VstFormat) -> Vec<VstEntry> {
                         path: path.to_string(),
                         format,
                         label,
+                        unique_id,
                         name: if name.is_empty() {
                             Path::new(path)
                                 .file_stem()
@@ -217,6 +226,9 @@ fn discover(tool: &Path, path: &str, format: VstFormat) -> Vec<VstEntry> {
             }
             "label" => {
                 current.insert("label", value.to_string());
+            }
+            "uniqueId" => {
+                current.insert("uniqueId", value.to_string());
             }
             "audio.ins" => {
                 current.insert("audio.ins", value.to_string());

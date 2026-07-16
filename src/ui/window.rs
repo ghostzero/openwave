@@ -263,6 +263,7 @@ fn wire_audio_events(app: &Rc<App>) {
                     refresh();
                 }
             }
+            AudioEvent::VstParams(_) => schedule_save(&app),
         }
     });
 }

@@ -114,8 +114,11 @@ Click the puzzle-piece button on a channel strip to open its effects.
 *Add VST Plugin…* lists the VST2/VST3 plugins found in your plugin folders;
 *Add Effect…* lists your installed LV2 plugins. Every plugin can be
 reordered, bypassed, and tweaked with live parameter sliders right in the
-dialog — no external plugin host UI. The VST rack processes first, then the
-LV2 chain; everything is restored automatically on the next start.
+dialog. VST plugins with their own editor also get a window button that
+opens the plugin's native UI — edits made there are synced back and the
+full plugin state is saved when the window closes. The VST rack processes
+first, then the LV2 chain; everything is restored automatically on the
+next start.
 
 ## How it works
 

@@ -99,7 +99,19 @@ pub enum VstState {
 pub struct VstRuntime {
     pub cfg_id: u64,
     pub state: VstState,
+    /// The plugin ships its own editor window (openable via show_vst_ui).
+    pub has_ui: bool,
     pub params: Vec<VstParamInfo>,
+}
+
+/// What a helper protocol line amounted to.
+#[derive(Default)]
+pub struct VstReplyOutcome {
+    /// Plugin load results arrived; the effects dialog should refresh.
+    pub structure_changed: bool,
+    /// Parameter edits made in a plugin's native UI: (cfg_id, index, value).
+    /// The caller persists these into the channel config.
+    pub params: Vec<(u64, u32, f64)>,
 }
 
 struct Slot {
@@ -171,6 +183,15 @@ pub struct FxManager {
 
 fn fx_dir() -> PathBuf {
     glib::user_config_dir().join("openwave").join("fx")
+}
+
+/// Per-channel directory for full VST plugin state (chunk data captured
+/// when a plugin's own editor window is closed, restored on load).
+fn vst_state_dir(id: u64) -> PathBuf {
+    glib::user_config_dir()
+        .join("openwave")
+        .join("vst-state")
+        .join(format!("ch{id}"))
 }
 
 fn sanitize_token(s: &str) -> String {
@@ -358,7 +379,16 @@ impl FxManager {
         }
         let desc: String = enabled
             .iter()
-            .map(|p| format!("{}\x1f{}\x1f{}\x1f{}", p.id, p.path, p.label, p.format.as_str()))
+            .map(|p| {
+                format!(
+                    "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+                    p.id,
+                    p.path,
+                    p.label,
+                    p.unique_id,
+                    p.format.as_str()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\x1e");
         let mut fails = 0;
@@ -386,6 +416,8 @@ impl FxManager {
         let Some(python) = glib::find_program_in_path("python3") else {
             return false;
         };
+        let state_dir = vst_state_dir(id);
+        let _ = fs::create_dir_all(&state_dir);
         let slot = Slot {
             pid: 0,
             alive: Rc::new(Cell::new(true)),
@@ -397,6 +429,7 @@ impl FxManager {
                 python.display().to_string(),
                 script.display().to_string(),
                 vst_node_name(id),
+                state_dir.display().to_string(),
             ],
             &format!("openwave-vst-ch{id}.log"),
         ) else {
@@ -421,7 +454,9 @@ impl FxManager {
                     "cfg_id": p.id,
                     "path": p.path,
                     "format": p.format.as_str(),
+                    "name": p.name,
                     "label": p.label,
+                    "unique_id": p.unique_id,
                     "active": true,
                     "params": p.params,
                 })
@@ -434,6 +469,7 @@ impl FxManager {
             .map(|p| VstRuntime {
                 cfg_id: p.id,
                 state: VstState::Loading,
+                has_ui: false,
                 params: Vec::new(),
             })
             .collect();
@@ -471,53 +507,91 @@ impl FxManager {
         }
     }
 
-    /// Process a protocol line from a helper. Returns true when the runtime
-    /// info changed (the UI should refresh).
-    pub fn handle_vst_reply(&mut self, id: u64, line: &str) -> bool {
+    /// Process a protocol line from a helper.
+    pub fn handle_vst_reply(&mut self, id: u64, line: &str) -> VstReplyOutcome {
+        let mut outcome = VstReplyOutcome::default();
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            return false;
+            return outcome;
         };
-        if v["reply"].as_str() != Some("loaded") {
-            return false;
-        }
         let Some(slot) = self.vsts.get_mut(&id) else {
-            return false;
+            return outcome;
         };
-        for item in v["plugins"].as_array().into_iter().flatten() {
-            let Some(cfg_id) = item["cfg_id"].as_u64() else {
-                continue;
-            };
-            let Some(rt) = slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id) else {
-                continue;
-            };
-            if item["ok"].as_bool() == Some(true) {
-                rt.state = VstState::Loaded;
-                rt.params = item["params"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| {
-                        Some(VstParamInfo {
-                            index: p["index"].as_u64()? as u32,
-                            name: p["name"].as_str().unwrap_or("Parameter").to_string(),
-                            min: p["min"].as_f64().unwrap_or(0.0),
-                            max: p["max"].as_f64().unwrap_or(1.0),
-                            value: p["value"].as_f64().unwrap_or(0.0),
-                            toggled: p["toggled"].as_bool().unwrap_or(false),
-                            integer: p["integer"].as_bool().unwrap_or(false),
-                        })
-                    })
-                    .collect();
-            } else {
-                rt.state = VstState::Failed(
-                    item["error"]
-                        .as_str()
-                        .unwrap_or("could not load plugin")
-                        .to_string(),
-                );
+        match v["reply"].as_str() {
+            Some("loaded") => {
+                for item in v["plugins"].as_array().into_iter().flatten() {
+                    let Some(cfg_id) = item["cfg_id"].as_u64() else {
+                        continue;
+                    };
+                    let Some(rt) = slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id)
+                    else {
+                        continue;
+                    };
+                    if item["ok"].as_bool() == Some(true) {
+                        rt.state = VstState::Loaded;
+                        rt.has_ui = item["has_ui"].as_bool().unwrap_or(false);
+                        rt.params = item["params"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|p| {
+                                Some(VstParamInfo {
+                                    index: p["index"].as_u64()? as u32,
+                                    name: p["name"]
+                                        .as_str()
+                                        .unwrap_or("Parameter")
+                                        .to_string(),
+                                    min: p["min"].as_f64().unwrap_or(0.0),
+                                    max: p["max"].as_f64().unwrap_or(1.0),
+                                    value: p["value"].as_f64().unwrap_or(0.0),
+                                    toggled: p["toggled"].as_bool().unwrap_or(false),
+                                    integer: p["integer"].as_bool().unwrap_or(false),
+                                })
+                            })
+                            .collect();
+                    } else {
+                        rt.state = VstState::Failed(
+                            item["error"]
+                                .as_str()
+                                .unwrap_or("could not load plugin")
+                                .to_string(),
+                        );
+                    }
+                }
+                outcome.structure_changed = true;
             }
+            Some("param") => {
+                // Edited in the plugin's native window; mirror + persist.
+                if let (Some(cfg_id), Some(index), Some(value)) = (
+                    v["cfg_id"].as_u64(),
+                    v["param"].as_u64(),
+                    v["value"].as_f64(),
+                ) {
+                    let index = index as u32;
+                    if let Some(rt) =
+                        slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id)
+                    {
+                        if let Some(p) = rt.params.iter_mut().find(|p| p.index == index)
+                        {
+                            p.value = value;
+                        }
+                    }
+                    outcome.params.push((cfg_id, index, value));
+                }
+            }
+            _ => {}
         }
-        true
+        outcome
+    }
+
+    /// Open (or close) a plugin's own editor window inside the helper.
+    pub fn show_vst_ui(&mut self, id: u64, cfg_id: u64, on: bool) {
+        let Some(slot) = self.vsts.get_mut(&id) else {
+            return;
+        };
+        if let Some(stdin) = slot.stdin.as_mut() {
+            let msg = serde_json::json!({ "cmd": "show_ui", "cfg_id": cfg_id, "on": on });
+            let _ = writeln!(stdin, "{msg}");
+        }
     }
 
     /// Keep trying to wire VSTIn.monitor → VST host → chain sink until the
@@ -588,6 +662,7 @@ impl FxManager {
         self.ensure_chain(id, None);
         self.kill_vst(id);
         let _ = fs::remove_file(fx_dir().join(format!("ch{id}.conf")));
+        let _ = fs::remove_dir_all(vst_state_dir(id));
     }
 
     pub fn shutdown_all(&mut self) {
