@@ -17,6 +17,7 @@ pub struct ChannelStrip {
     pub root: gtk::Box,
     pub name: gtk::EditableLabel,
     pub remove: gtk::Button,
+    pub fx: gtk::Button,
     pub input: gtk::DropDown,
     pub level: gtk::LevelBar,
     pub monitor_scale: gtk::Scale,
@@ -74,15 +75,24 @@ impl ChannelStrip {
         name.add_css_class("heading");
 
         let remove = gtk::Button::builder()
-            .icon_name("window-close-symbolic")
+            .icon_name("user-trash-symbolic")
             .tooltip_text("Remove channel")
             .valign(gtk::Align::Center)
             .build();
         remove.add_css_class("flat");
         remove.add_css_class("circular");
 
+        let fx = gtk::Button::builder()
+            .icon_name("sound-wave-symbolic")
+            .tooltip_text("Effects")
+            .valign(gtk::Align::Center)
+            .build();
+        fx.add_css_class("flat");
+        fx.add_css_class("circular");
+
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         header.append(&name);
+        header.append(&fx);
         header.append(&remove);
 
         let input = gtk::DropDown::builder()
@@ -124,6 +134,7 @@ impl ChannelStrip {
             root,
             name,
             remove,
+            fx,
             input,
             level,
             monitor_scale,
@@ -147,7 +158,31 @@ impl ChannelStrip {
         self.monitor_mute.set_active(c.monitor_muted);
         self.stream_mute.set_active(c.stream_muted);
         self.link.set_active(c.linked);
+        self.update_fx_indicator(c);
         self.guard.set(false);
+    }
+
+    /// Tint the FX button while the channel processes through effects.
+    pub fn update_fx_indicator(&self, c: &ChannelConfig) {
+        let lv2 = c.effects.iter().filter(|e| e.enabled).count();
+        let vst = c.vst_plugins.iter().filter(|p| p.enabled).count();
+        if c.fx_active() {
+            self.fx.add_css_class("accent");
+        } else {
+            self.fx.remove_css_class("accent");
+        }
+        let mut tip = String::from("Effects");
+        let mut parts = Vec::new();
+        if vst > 0 {
+            parts.push(format!("{vst} VST"));
+        }
+        if lv2 > 0 {
+            parts.push(format!("{lv2} LV2"));
+        }
+        if !parts.is_empty() {
+            tip = format!("Effects ({} active)", parts.join(" + "));
+        }
+        self.fx.set_tooltip_text(Some(&tip));
     }
 
     /// Rebuild the input drop-down. `current` is kept selected; if it is not

@@ -10,6 +10,7 @@ use crate::audio::{AudioEvent, LevelTarget, Mix, PulseManager};
 use crate::config::{Assignment, Config, MAX_CHANNELS};
 
 use super::channel_strip::ChannelStrip;
+use super::effects::{self, EffectsDeps};
 use super::heading_label;
 use super::outputs::OutputsPanel;
 use super::sidebar::Sidebar;
@@ -29,6 +30,9 @@ struct App {
     save_pending: Cell<bool>,
     /// Per-channel edit counter used to debounce rename → sink rebuild.
     rename_epoch: RefCell<HashMap<u64, u64>>,
+    /// The open effects dialog (channel id + hooks), so VST rack load
+    /// results and native-UI parameter edits can update it live.
+    fx_dialog: RefCell<Option<(u64, Rc<effects::DialogHooks>)>>,
     /// Forces every strip and the add-channel card to the same width.
     strip_size_group: gtk::SizeGroup,
 }
@@ -185,6 +189,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         error_page,
         save_pending: Cell::new(false),
         rename_epoch: RefCell::new(HashMap::new()),
+        fx_dialog: RefCell::new(None),
         strip_size_group,
     });
 
@@ -247,6 +252,29 @@ fn wire_audio_events(app: &Rc<App>) {
                 LevelTarget::MonitorMix => app.outputs.monitor_level.set_value(v),
                 LevelTarget::StreamMix => app.outputs.stream_level.set_value(v),
             },
+            AudioEvent::VstChanged(id) => {
+                let hooks = app
+                    .fx_dialog
+                    .borrow()
+                    .as_ref()
+                    .filter(|(did, _)| *did == id)
+                    .map(|(_, h)| h.clone());
+                if let Some(hooks) = hooks {
+                    (hooks.refresh)();
+                }
+            }
+            AudioEvent::VstParams(id, updates) => {
+                schedule_save(&app);
+                let hooks = app
+                    .fx_dialog
+                    .borrow()
+                    .as_ref()
+                    .filter(|(did, _)| *did == id)
+                    .map(|(_, h)| h.clone());
+                if let Some(hooks) = hooks {
+                    (hooks.sync_params)(&updates);
+                }
+            }
         }
     });
 }
@@ -340,11 +368,10 @@ fn rebuild_strips(app: &Rc<App>) {
         let strip = ChannelStrip::new();
         strip.load_config(ch);
         if ch.permanent {
-            // Keep the button allocated so permanent strips get the exact
-            // same header layout as removable ones.
-            strip.remove.set_opacity(0.0);
+            // Shown but disabled: permanent strips keep the exact same
+            // header layout as removable ones.
             strip.remove.set_sensitive(false);
-            strip.remove.set_tooltip_text(None);
+            strip.remove.set_tooltip_text(Some("Built-in channels cannot be removed"));
         }
         wire_strip(app, &strip, ch.id);
         app.strips_box.append(&strip.root);
@@ -549,6 +576,50 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                 stream_scale.set_value(monitor_scale.value());
             }
             schedule_save(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        strip.fx.connect_clicked(move |btn| {
+            let on_structure = {
+                let app = app.clone();
+                Rc::new(move |id: u64| {
+                    app.manager.rebuild_channel(id);
+                    schedule_save(&app);
+                    update_sidebar(&app);
+                    let cfg = app.config.borrow();
+                    if let Some(ch) = cfg.channel(id) {
+                        if let Some((_, strip)) =
+                            app.strips.borrow().iter().find(|(cid, _)| *cid == id)
+                        {
+                            strip.update_fx_indicator(ch);
+                        }
+                    }
+                })
+            };
+            let on_control = {
+                let app = app.clone();
+                Rc::new(move |_id: u64| schedule_save(&app))
+            };
+            let (dialog, hooks) = effects::open(
+                btn,
+                EffectsDeps {
+                    config: app.config.clone(),
+                    manager: app.manager.clone(),
+                    on_structure,
+                    on_control,
+                },
+                id,
+            );
+            *app.fx_dialog.borrow_mut() = Some((id, Rc::new(hooks)));
+            let app = app.clone();
+            dialog.connect_closed(move |_| {
+                let mut open = app.fx_dialog.borrow_mut();
+                if open.as_ref().is_some_and(|(did, _)| *did == id) {
+                    *open = None;
+                }
+            });
         });
     }
 

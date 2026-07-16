@@ -1,4 +1,5 @@
 pub mod channel_strip;
+pub mod effects;
 pub mod outputs;
 pub mod sidebar;
 pub mod window;
@@ -42,6 +43,10 @@ pub fn load_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // Make the bundled symbolic icons (registered as a GResource in
+        // main) resolvable by name like theme icons.
+        gtk::IconTheme::for_display(&display)
+            .add_resource_path("/de/ghostzero/OpenWave/icons");
     }
 }
 

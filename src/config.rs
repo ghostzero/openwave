@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -22,6 +22,72 @@ pub enum Assignment {
     Virtual,
 }
 
+/// One LV2 plugin instance in a channel's effect chain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EffectConfig {
+    /// Stable identifier, unique within the channel; used as the node label
+    /// in the generated filter-chain graph, so it must survive reordering.
+    pub id: u64,
+    /// LV2 plugin URI.
+    pub uri: String,
+    /// Display name (cached from the plugin so the UI works even when the
+    /// plugin is uninstalled later).
+    pub name: String,
+    pub enabled: bool,
+    /// Control-port values by port symbol; ports not listed here keep the
+    /// plugin's default.
+    pub controls: BTreeMap<String, f64>,
+}
+
+impl Default for EffectConfig {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            uri: String::new(),
+            name: String::new(),
+            enabled: true,
+            controls: BTreeMap::new(),
+        }
+    }
+}
+
+/// One VST2/VST3 plugin in a channel's rack, hosted by the helper process.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VstPluginConfig {
+    /// Stable identifier, unique within the channel.
+    pub id: u64,
+    /// Path to the .so / .vst3 binary.
+    pub path: String,
+    pub format: crate::vst::VstFormat,
+    /// Sub-plugin label inside a multi-plugin bundle (VST3); empty otherwise.
+    pub label: String,
+    /// Sub-plugin selector for multi-plugin binaries (0 = whole file).
+    pub unique_id: i64,
+    /// Display name (cached from discovery).
+    pub name: String,
+    pub enabled: bool,
+    /// Parameter values by parameter index (as decimal string keys, since
+    /// JSON object keys are strings).
+    pub params: BTreeMap<String, f64>,
+}
+
+impl Default for VstPluginConfig {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            path: String::new(),
+            format: crate::vst::VstFormat::Vst2,
+            label: String::new(),
+            unique_id: 0,
+            name: String::new(),
+            enabled: true,
+            params: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelConfig {
@@ -36,6 +102,14 @@ pub struct ChannelConfig {
     pub linked: bool,
     /// Built-in channels (Microphone, System) that cannot be removed.
     pub permanent: bool,
+    /// LV2 effect chain applied to this channel's input before it reaches
+    /// the monitor/stream mixes.
+    pub effects: Vec<EffectConfig>,
+    /// Next effect/VST id for this channel; never reused, shared by both
+    /// lists.
+    pub next_effect_id: u64,
+    /// VST rack processed in front of the LV2 chain.
+    pub vst_plugins: Vec<VstPluginConfig>,
 }
 
 impl Default for ChannelConfig {
@@ -50,7 +124,65 @@ impl Default for ChannelConfig {
             stream_muted: false,
             linked: false,
             permanent: false,
+            effects: Vec::new(),
+            next_effect_id: 1,
+            vst_plugins: Vec::new(),
         }
+    }
+}
+
+impl ChannelConfig {
+    /// Effects that should actually be instantiated in the chain.
+    pub fn enabled_effects(&self) -> Vec<&EffectConfig> {
+        self.effects.iter().filter(|e| e.enabled).collect()
+    }
+
+    /// VST plugins that should actually be loaded into the rack.
+    pub fn enabled_vsts(&self) -> Vec<&VstPluginConfig> {
+        self.vst_plugins.iter().filter(|p| p.enabled).collect()
+    }
+
+    /// Whether this channel routes through an FX bridge at all.
+    pub fn fx_active(&self) -> bool {
+        self.effects.iter().any(|e| e.enabled)
+            || self.vst_plugins.iter().any(|p| p.enabled)
+    }
+
+    /// Append an effect and return a reference to it.
+    pub fn add_effect(&mut self, uri: &str, name: &str) -> &EffectConfig {
+        let id = self.next_effect_id;
+        self.next_effect_id += 1;
+        self.effects.push(EffectConfig {
+            id,
+            uri: uri.to_string(),
+            name: name.to_string(),
+            ..EffectConfig::default()
+        });
+        self.effects.last().unwrap()
+    }
+
+    pub fn effect_mut(&mut self, effect_id: u64) -> Option<&mut EffectConfig> {
+        self.effects.iter_mut().find(|e| e.id == effect_id)
+    }
+
+    /// Append a VST plugin from a discovery entry.
+    pub fn add_vst(&mut self, entry: &crate::vst::VstEntry) -> u64 {
+        let id = self.next_effect_id;
+        self.next_effect_id += 1;
+        self.vst_plugins.push(VstPluginConfig {
+            id,
+            path: entry.path.clone(),
+            format: entry.format,
+            label: entry.label.clone(),
+            unique_id: entry.unique_id,
+            name: entry.name.clone(),
+            ..VstPluginConfig::default()
+        });
+        id
+    }
+
+    pub fn vst_mut(&mut self, vst_id: u64) -> Option<&mut VstPluginConfig> {
+        self.vst_plugins.iter_mut().find(|p| p.id == vst_id)
     }
 }
 
@@ -146,6 +278,27 @@ impl Config {
             }
             ch.monitor_volume = ch.monitor_volume.clamp(0.0, 1.0);
             ch.stream_volume = ch.stream_volume.clamp(0.0, 1.0);
+            // Repair effect/VST ids the same way as channel ids (they share
+            // one id space per channel).
+            let mut seen_fx: HashSet<u64> = HashSet::new();
+            let mut max_fx = 0;
+            for fx in &mut ch.effects {
+                if fx.id == 0 || seen_fx.contains(&fx.id) {
+                    fx.id = ch.next_effect_id.max(max_fx + 1);
+                }
+                seen_fx.insert(fx.id);
+                max_fx = max_fx.max(fx.id);
+            }
+            for p in &mut ch.vst_plugins {
+                if p.id == 0 || seen_fx.contains(&p.id) {
+                    p.id = ch.next_effect_id.max(max_fx + 1);
+                }
+                seen_fx.insert(p.id);
+                max_fx = max_fx.max(p.id);
+            }
+            ch.effects.retain(|fx| !fx.uri.is_empty());
+            ch.vst_plugins.retain(|p| !p.path.is_empty());
+            ch.next_effect_id = ch.next_effect_id.max(max_fx + 1);
         }
         cfg.channels.truncate(MAX_CHANNELS);
         cfg.next_channel_id = cfg.next_channel_id.max(max_id + 1);
