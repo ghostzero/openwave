@@ -5,7 +5,7 @@ use adw::prelude::*;
 
 use crate::config::{Assignment, ChannelConfig};
 
-use super::{label_factory, meter_bar, mute_button};
+use super::{label_factory, meter_pair, mute_button, MeterPair};
 
 /// Fixed width of every channel strip (and the add-channel card).
 pub const STRIP_WIDTH: i32 = 150;
@@ -19,7 +19,7 @@ pub struct ChannelStrip {
     pub remove: gtk::Button,
     pub fx: gtk::Button,
     pub input: gtk::DropDown,
-    pub level: gtk::LevelBar,
+    level: MeterPair,
     pub monitor_scale: gtk::Scale,
     pub stream_scale: gtk::Scale,
     pub monitor_mute: gtk::ToggleButton,
@@ -101,7 +101,7 @@ impl ChannelStrip {
         input.set_factory(Some(&label_factory(9, true)));
         input.set_list_factory(Some(&label_factory(36, false)));
 
-        let level = meter_bar();
+        let level = meter_pair();
 
         let monitor_scale = fader();
         monitor_scale.set_tooltip_text(Some("Monitor mix volume"));
@@ -127,7 +127,7 @@ impl ChannelStrip {
 
         root.append(&header);
         root.append(&input);
-        root.append(&level);
+        root.append(&level.root);
         root.append(&faders);
 
         Self {
@@ -146,6 +146,12 @@ impl ChannelStrip {
             entries: Rc::new(RefCell::new(Vec::new())),
             last_labels: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Feed measured peaks: one value for mono inputs, two for stereo. The
+    /// right meter is shown only while the input reports stereo levels.
+    pub fn set_levels(&self, values: &[f64]) {
+        self.level.set_levels(values);
     }
 
     /// Push the current config values into the widgets without firing the
