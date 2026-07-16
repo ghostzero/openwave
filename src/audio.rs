@@ -42,8 +42,14 @@ const OWN_PREFIX: &str = "OpenWave_";
 const LOOPBACK_ARGS: &str = "latency_msec=30";
 const INVALID_INDEX: u32 = u32::MAX;
 
-fn channel_sink_name(id: u64) -> String {
+pub fn channel_sink_name(id: u64) -> String {
     format!("{OWN_PREFIX}Ch{id}")
+}
+
+/// Does this device name/description belong to an Elgato Wave XLR?
+fn is_wave_xlr(name: &str, description: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    description.contains("Wave XLR") || n.contains("wave_xlr") || n.contains("wave-xlr")
 }
 
 /// Strip characters that would break PulseAudio module argument quoting.
@@ -98,12 +104,18 @@ pub struct SourceEntry {
     pub name: String,
     pub description: String,
     pub is_monitor: bool,
+    /// Current device volume in percent (avg across channels).
+    pub volume: f64,
+    pub channels: u8,
 }
 
 #[derive(Clone, Debug)]
 pub struct SinkEntry {
     pub name: String,
     pub description: String,
+    /// Current device volume in percent (avg across channels).
+    pub volume: f64,
+    pub channels: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +177,7 @@ struct Inner {
     sources: Vec<SourceEntry>,
     sink_inputs: HashMap<u32, SinkInputEntry>,
     default_sink: Option<String>,
+    default_source: Option<String>,
     /// Per-channel runtime state, keyed by the channel's stable config id.
     channels: HashMap<u64, ChannelRuntime>,
     /// Effect helper processes (filter chains, Carla racks).
@@ -427,11 +440,10 @@ impl PulseManager {
             {
                 continue;
             }
-            if let Some(n) = &si.app_name {
-                if !n.is_empty() {
+            if let Some(n) = &si.app_name
+                && !n.is_empty() {
                     set.insert(n.clone());
                 }
-            }
         }
         set.into_iter().collect()
     }
@@ -443,6 +455,100 @@ impl PulseManager {
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.description.clone())
+    }
+
+    pub fn default_sink(&self) -> Option<String> {
+        self.inner.borrow().default_sink.clone()
+    }
+
+    pub fn default_source(&self) -> Option<String> {
+        self.inner.borrow().default_source.clone()
+    }
+
+    /// Unlike `output_sinks`/`sources`, these also see OpenWave's own devices.
+    pub fn has_sink(&self, name: &str) -> bool {
+        self.inner.borrow().sinks.iter().any(|(_, e)| e.name == name)
+    }
+
+    pub fn has_source(&self, name: &str) -> bool {
+        self.inner.borrow().sources.iter().any(|s| s.name == name)
+    }
+
+    pub fn set_default_sink(&self, name: &str) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(ctx) = inner
+            .context
+            .as_mut()
+            .filter(|c| c.get_state() == CtxState::Ready)
+        {
+            let _ = ctx.set_default_sink(name, |_| {});
+        }
+    }
+
+    pub fn set_default_source(&self, name: &str) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(ctx) = inner
+            .context
+            .as_mut()
+            .filter(|c| c.get_state() == CtxState::Ready)
+        {
+            let _ = ctx.set_default_source(name, |_| {});
+        }
+    }
+
+    /// Set a capture device's volume (percent of `Volume::NORMAL`).
+    pub fn set_source_volume(&self, name: &str, percent: f64) {
+        let channels = {
+            let inner = self.inner.borrow();
+            let Some(s) = inner.sources.iter().find(|s| s.name == name) else {
+                return;
+            };
+            s.channels
+        };
+        let Some(mut intro) = Self::introspect(&self.inner) else {
+            return;
+        };
+        let cv = volume_cv(channels, percent / 100.0);
+        let _ = intro.set_source_volume_by_name(name, &cv, None);
+    }
+
+    /// Set an output device's volume (percent of `Volume::NORMAL`).
+    pub fn set_sink_volume(&self, name: &str, percent: f64) {
+        let channels = {
+            let inner = self.inner.borrow();
+            let Some((_, s)) = inner.sinks.iter().find(|(_, e)| e.name == name) else {
+                return;
+            };
+            s.channels
+        };
+        let Some(mut intro) = Self::introspect(&self.inner) else {
+            return;
+        };
+        let cv = volume_cv(channels, percent / 100.0);
+        let _ = intro.set_sink_volume_by_name(name, &cv, None);
+    }
+
+    /// The Wave XLR's capture device ("Elgato Wave XLR Mono"), if connected.
+    pub fn wave_xlr_source(&self) -> Option<SourceEntry> {
+        let inner = self.inner.borrow();
+        let mut matches = inner.sources.iter().filter(|s| {
+            !s.is_monitor
+                && !s.name.starts_with(OWN_PREFIX)
+                && is_wave_xlr(&s.name, &s.description)
+        });
+        matches.next().cloned()
+    }
+
+    /// The Wave XLR's output device ("Elgato Wave XLR Analog Stereo"), if
+    /// connected.
+    pub fn wave_xlr_sink(&self) -> Option<SinkEntry> {
+        let inner = self.inner.borrow();
+        inner
+            .sinks
+            .iter()
+            .map(|(_, e)| e)
+            .find(|e| !e.name.starts_with(OWN_PREFIX) && is_wave_xlr(&e.name, &e.description))
+            .cloned()
     }
 
     // ---- Internals -----------------------------------------------------------
@@ -488,11 +594,10 @@ impl PulseManager {
             Some(CtxState::Failed) => {
                 Self::fail(rc, "The connection to the audio server failed.")
             }
-            Some(CtxState::Terminated) => {
-                if !rc.borrow().shutting_down {
+            Some(CtxState::Terminated)
+                if !rc.borrow().shutting_down => {
                     Self::fail(rc, "The audio server terminated the connection.");
                 }
-            }
             _ => {}
         }
     }
@@ -505,8 +610,8 @@ impl PulseManager {
                 return;
             };
             ctx.set_subscribe_callback(Some(Box::new(move |facility, _op, _idx| {
-                if let Some(rc) = weak.upgrade() {
-                    if matches!(
+                if let Some(rc) = weak.upgrade()
+                    && matches!(
                         facility,
                         Some(
                             Facility::Sink
@@ -517,7 +622,6 @@ impl PulseManager {
                     ) {
                         Self::schedule_refresh(&rc);
                     }
-                }
             })));
             ctx.subscribe(
                 InterestMaskSet::SINK
@@ -572,11 +676,10 @@ impl PulseManager {
                     let remaining = remaining.clone();
                     let _ = intro.unload_module(m, move |_| {
                         remaining.set(remaining.get().saturating_sub(1));
-                        if remaining.get() == 0 {
-                            if let Some(rc) = weak.upgrade() {
+                        if remaining.get() == 0
+                            && let Some(rc) = weak.upgrade() {
                                 Self::create_virtual_sinks(&rc);
                             }
-                        }
                     });
                 }
             }
@@ -689,8 +792,11 @@ impl PulseManager {
             let weak = Rc::downgrade(rc);
             let _ = intro.get_server_info(move |info| {
                 if let Some(rc) = weak.upgrade() {
-                    rc.borrow_mut().default_sink =
+                    let mut inner = rc.borrow_mut();
+                    inner.default_sink =
                         info.default_sink_name.as_ref().map(|c| c.to_string());
+                    inner.default_source =
+                        info.default_source_name.as_ref().map(|c| c.to_string());
                 }
             });
         }
@@ -708,6 +814,9 @@ impl PulseManager {
                                 .as_ref()
                                 .map(|d| d.to_string())
                                 .unwrap_or_else(|| name.to_string()),
+                            volume: 100.0 * f64::from(s.volume.avg().0)
+                                / f64::from(Volume::NORMAL.0),
+                            channels: s.volume.len(),
                         },
                     ));
                 }
@@ -739,6 +848,9 @@ impl PulseManager {
                             .as_ref()
                             .map(|d| d.to_string())
                             .unwrap_or_else(|| name.clone()),
+                        volume: 100.0 * f64::from(s.volume.avg().0)
+                            / f64::from(Volume::NORMAL.0),
+                        channels: s.volume.len(),
                         name,
                     });
                 }
@@ -828,21 +940,19 @@ impl PulseManager {
                     &mut rt.stream_loop,
                     &mut rt.input_loop,
                 ] {
-                    if let (Some(m), None) = (l.module, l.sink_input) {
-                        if let Some(&(si, chans)) = by_module.get(&m) {
+                    if let (Some(m), None) = (l.module, l.sink_input)
+                        && let Some(&(si, chans)) = by_module.get(&m) {
                             l.sink_input = Some(si);
                             l.channels = chans;
                         }
-                    }
                 }
             }
             let l = &mut inner.monitor_out;
-            if let (Some(m), None) = (l.module, l.sink_input) {
-                if let Some(&(si, chans)) = by_module.get(&m) {
+            if let (Some(m), None) = (l.module, l.sink_input)
+                && let Some(&(si, chans)) = by_module.get(&m) {
                     l.sink_input = Some(si);
                     l.channels = chans;
                 }
-            }
 
             // Detect drift between the server state and our desired state:
             // wrong volume/mute is re-applied, a loopback attached to the
@@ -889,13 +999,12 @@ impl PulseManager {
                 applies.push((None, Mix::Monitor));
             }
         }
-        if !moves.is_empty() {
-            if let Some(mut intro) = Self::introspect(rc) {
+        if !moves.is_empty()
+            && let Some(mut intro) = Self::introspect(rc) {
                 for (si, sink) in moves {
                     let _ = intro.move_sink_input_by_name(si, &sink, None);
                 }
             }
-        }
         for (id, mix) in applies {
             match id {
                 Some(id) => Self::apply_channel_mix_inner(rc, id, mix),
@@ -1133,13 +1242,49 @@ impl PulseManager {
     /// through its FX bridge (Carla rack and/or LV2 filter chain). `source`
     /// is the channel's real input: a capture source or `<sink>.monitor`.
     fn wire_channel_input(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64, source: &str) {
+        // The first lv2::catalog() call scans every installed bundle, far too
+        // slow for the main loop. While the startup warm-up scan is still
+        // running, park FX channels until it lands instead of blocking.
+        let needs_catalog = {
+            let inner = rc.borrow();
+            let cfg = inner.config.borrow();
+            cfg.channel(id).is_some_and(|c| !c.effects.is_empty())
+        };
+        if needs_catalog && lv2::scan_pending() {
+            let weak = Rc::downgrade(rc);
+            let source = source.to_owned();
+            lv2::when_ready(move || {
+                let Some(rc) = weak.upgrade() else {
+                    return;
+                };
+                let stale = {
+                    let inner = rc.borrow();
+                    inner.shutting_down
+                        || inner
+                            .channels
+                            .get(&id)
+                            .is_none_or(|rt| rt.generation != generation_id)
+                };
+                if !stale {
+                    Self::wire_channel_input(&rc, id, generation_id, &source);
+                }
+            });
+            return;
+        }
         let (conf, channel_cfg) = {
             let inner = rc.borrow();
             let cfg = inner.config.borrow();
             let Some(c) = cfg.channel(id) else {
                 return;
             };
-            (fx::chain_conf(id, c, lv2::catalog().as_deref()), c.clone())
+            // Only touch the catalog when there are effects: for everyone
+            // else this must never wait on the warm-up scan.
+            let catalog = if c.effects.is_empty() {
+                None
+            } else {
+                lv2::catalog()
+            };
+            (fx::chain_conf(id, c, catalog.as_deref()), c.clone())
         };
         let Some(conf) = conf else {
             // No active effects: the classic direct wiring.
@@ -1608,14 +1753,13 @@ impl PulseManager {
                         }
                     }
                 }
-                if got_data {
-                    if let Some(rc) = weak_inner.upgrade() {
+                if got_data
+                    && let Some(rc) = weak_inner.upgrade() {
                         Self::emit(
                             &rc,
                             AudioEvent::Level(target, f64::from(peak.clamp(0.0, 1.0))),
                         );
                     }
-                }
             })));
         let attr = BufferAttr {
             maxlength: u32::MAX,

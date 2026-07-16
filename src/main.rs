@@ -96,6 +96,9 @@ fn main() -> glib::ExitCode {
     }
     app.connect_startup(|_| {
         ui::load_css();
+        // Scan the LV2 world in the background so channel wiring and the
+        // effects dialog don't freeze the UI on first use.
+        lv2::warm();
         // Warm the VST discovery cache so the plugin picker opens fast.
         if vst::available() {
             std::thread::spawn(|| {

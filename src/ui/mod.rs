@@ -1,7 +1,9 @@
 pub mod channel_strip;
 pub mod effects;
 pub mod outputs;
+pub mod setup;
 pub mod sidebar;
+pub mod wave_xlr;
 pub mod window;
 
 use adw::prelude::*;

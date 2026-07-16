@@ -13,11 +13,15 @@ use super::channel_strip::ChannelStrip;
 use super::effects::{self, EffectsDeps};
 use super::heading_label;
 use super::outputs::OutputsPanel;
+use super::setup;
 use super::sidebar::Sidebar;
+use super::wave_xlr;
 
 struct App {
     config: Rc<RefCell<Config>>,
     manager: PulseManager,
+    window: glib::WeakRef<adw::ApplicationWindow>,
+    toasts: adw::ToastOverlay,
     /// Channel strips currently shown, each paired with its channel id.
     strips: RefCell<Vec<(u64, ChannelStrip)>>,
     strips_box: gtk::Box,
@@ -33,6 +37,15 @@ struct App {
     /// The open effects dialog (channel id + hooks), so VST rack load
     /// results and native-UI parameter edits can update it live.
     fx_dialog: RefCell<Option<(u64, Rc<effects::DialogHooks>)>>,
+    /// Refresh hook of the open setup dialog, driven by device changes.
+    setup_hook: RefCell<Option<Rc<dyn Fn()>>>,
+    /// First-run dialog / misconfiguration notice already handled this
+    /// session.
+    setup_prompted: Cell<bool>,
+    /// Wave XLR volumes were restored for the current device appearance;
+    /// reset when the device disappears so a replug restores them again.
+    xlr_mic_restored: Cell<bool>,
+    xlr_out_restored: Cell<bool>,
     /// Forces every strip and the add-channel card to the same width.
     strip_size_group: gtk::SizeGroup,
 }
@@ -131,6 +144,8 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
 
     let menu = gio::Menu::new();
     let menu_settings = gio::Menu::new();
+    menu_settings.append(Some("Audio Setup…"), Some("win.setup"));
+    menu_settings.append(Some("Wave XLR…"), Some("win.wave-xlr"));
     menu_settings.append(Some("Start at Login"), Some("win.autostart"));
     menu.append_section(None, &menu_settings);
     let menu_general = gio::Menu::new();
@@ -151,9 +166,12 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         .build();
     header.pack_end(&sidebar_toggle);
 
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&stack));
+
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&stack));
+    toolbar.set_content(Some(&toasts));
 
     let split = adw::OverlaySplitView::builder()
         .content(&toolbar)
@@ -179,6 +197,8 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let app = Rc::new(App {
         config,
         manager,
+        window: window.downgrade(),
+        toasts,
         strips: RefCell::new(Vec::new()),
         strips_box,
         add_button,
@@ -190,6 +210,10 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         save_pending: Cell::new(false),
         rename_epoch: RefCell::new(HashMap::new()),
         fx_dialog: RefCell::new(None),
+        setup_hook: RefCell::new(None),
+        setup_prompted: Cell::new(false),
+        xlr_mic_restored: Cell::new(false),
+        xlr_out_restored: Cell::new(false),
         strip_size_group,
     });
 
@@ -205,6 +229,18 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     }
     wire_close(&app, &window);
     wire_quit(&app, application, &window);
+
+    // A window started with --hidden gets its setup check when it is first
+    // shown instead of at startup.
+    {
+        let app = app.clone();
+        window.connect_map(move |_| {
+            let app = app.clone();
+            glib::timeout_add_local_once(Duration::from_secs(1), move || {
+                maybe_prompt_setup(&app);
+            });
+        });
+    }
 
     rebuild_strips(&app);
     app.manager.connect_server();
@@ -235,12 +271,25 @@ fn wire_audio_events(app: &Rc<App>) {
         match ev {
             AudioEvent::Ready => {
                 app.stack.set_visible_child_name("mixer");
+                // Give the buses/loopbacks a moment to settle before judging
+                // the setup, so startup churn doesn't read as misconfigured.
+                let app = app.clone();
+                glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                    maybe_prompt_setup(&app);
+                });
             }
             AudioEvent::Failed(msg) => {
                 app.error_page.set_description(Some(&msg));
                 app.stack.set_visible_child_name("error");
             }
-            AudioEvent::DevicesChanged => refresh_devices(&app),
+            AudioEvent::DevicesChanged => {
+                refresh_devices(&app);
+                restore_wave_xlr(&app);
+                let hook = app.setup_hook.borrow().clone();
+                if let Some(refresh) = hook {
+                    refresh();
+                }
+            }
             AudioEvent::Level(target, v) => match target {
                 LevelTarget::Channel(id) => {
                     if let Some((_, strip)) =
@@ -589,13 +638,12 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                     schedule_save(&app);
                     update_sidebar(&app);
                     let cfg = app.config.borrow();
-                    if let Some(ch) = cfg.channel(id) {
-                        if let Some((_, strip)) =
+                    if let Some(ch) = cfg.channel(id)
+                        && let Some((_, strip)) =
                             app.strips.borrow().iter().find(|(cid, _)| *cid == id)
                         {
                             strip.update_fx_indicator(ch);
                         }
-                    }
                 })
             };
             let on_control = {
@@ -625,12 +673,33 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
 
     {
         let app = app.clone();
-        strip.remove.connect_clicked(move |_| {
-            app.config.borrow_mut().remove_channel(id);
-            app.manager.rebuild_channel(id);
-            rebuild_strips(&app);
-            schedule_save(&app);
-            update_sidebar(&app);
+        strip.remove.connect_clicked(move |btn| {
+            let name = app
+                .config
+                .borrow()
+                .channel(id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let confirm = adw::AlertDialog::builder()
+                .heading("Remove Channel?")
+                .body(format!(
+                    "“{name}” will be removed, along with its input assignment, \
+                     mix levels and effects."
+                ))
+                .default_response("cancel")
+                .close_response("cancel")
+                .build();
+            confirm.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+            confirm.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            let app = app.clone();
+            confirm.connect_response(Some("remove"), move |_, _| {
+                app.config.borrow_mut().remove_channel(id);
+                app.manager.rebuild_channel(id);
+                rebuild_strips(&app);
+                schedule_save(&app);
+                update_sidebar(&app);
+            });
+            confirm.present(Some(btn));
         });
     }
 }
@@ -721,6 +790,126 @@ fn wire_outputs(app: &Rc<App>) {
     }
 }
 
+// ---- Setup assistant --------------------------------------------------------
+
+/// First run: present the setup assistant. Later runs: if the system audio
+/// drifted away from the recommended setup, show a notice with a shortcut to
+/// the assistant. Runs at most once per session, and only while the window
+/// is actually visible.
+fn maybe_prompt_setup(app: &Rc<App>) {
+    if app.setup_prompted.get() {
+        return;
+    }
+    let Some(window) = app.window.upgrade() else {
+        return;
+    };
+    if !window.is_visible()
+        || app.stack.visible_child_name().as_deref() != Some("mixer")
+    {
+        return;
+    }
+    let (first_run, all_ok) = {
+        let cfg = app.config.borrow();
+        (!cfg.setup_done, setup::all_ok(&cfg, &app.manager))
+    };
+    app.setup_prompted.set(true);
+    if first_run {
+        app.config.borrow_mut().setup_done = true;
+        schedule_save(app);
+        open_setup(app);
+    } else if !all_ok {
+        let toast = adw::Toast::builder()
+            .title("The system audio setup needs attention")
+            .button_label("Review")
+            .timeout(0)
+            .build();
+        {
+            let app = app.clone();
+            toast.connect_button_clicked(move |_| open_setup(&app));
+        }
+        app.toasts.add_toast(toast);
+    }
+}
+
+fn open_setup(app: &Rc<App>) {
+    if app.setup_hook.borrow().is_some() {
+        return;
+    }
+    let Some(window) = app.window.upgrade() else {
+        return;
+    };
+    let on_changed: Rc<dyn Fn()> = {
+        let app = app.clone();
+        Rc::new(move || {
+            schedule_save(&app);
+            refresh_devices(&app);
+            update_sidebar(&app);
+        })
+    };
+    let (dialog, refresh) = setup::open(
+        &window,
+        setup::SetupDeps {
+            config: app.config.clone(),
+            manager: app.manager.clone(),
+            on_changed,
+        },
+    );
+    *app.setup_hook.borrow_mut() = Some(refresh);
+    let app = app.clone();
+    dialog.connect_closed(move |_| {
+        *app.setup_hook.borrow_mut() = None;
+    });
+}
+
+// ---- Wave XLR ---------------------------------------------------------------
+
+fn open_wave_xlr(app: &Rc<App>) {
+    let Some(window) = app.window.upgrade() else {
+        return;
+    };
+    let on_changed: Rc<dyn Fn()> = {
+        let app = app.clone();
+        Rc::new(move || schedule_save(&app))
+    };
+    wave_xlr::open(
+        &window,
+        wave_xlr::XlrDeps {
+            config: app.config.clone(),
+            manager: app.manager.clone(),
+            on_changed,
+        },
+    );
+}
+
+/// Re-apply the stored Wave XLR volumes once per device appearance (startup
+/// and every replug), working around the device forgetting its levels.
+fn restore_wave_xlr(app: &Rc<App>) {
+    let (mic, out) = {
+        let cfg = app.config.borrow();
+        (cfg.wave_xlr.mic_volume, cfg.wave_xlr.output_volume)
+    };
+    match app.manager.wave_xlr_source() {
+        Some(src) => {
+            if !app.xlr_mic_restored.replace(true)
+                && let Some(pct) = mic
+            {
+                app.manager.set_source_volume(&src.name, pct);
+            }
+        }
+        None => app.xlr_mic_restored.set(false),
+    }
+    match app.manager.wave_xlr_sink() {
+        Some(snk) => {
+            if !app.xlr_out_restored.replace(true)
+                && let Some(pct) = out
+            {
+                app.manager.set_sink_volume(&snk.name, pct);
+            }
+        }
+        None => app.xlr_out_restored.set(false),
+    }
+}
+
 // ---- Window actions -------------------------------------------------------------
 
 // ---- Autostart -------------------------------------------------------------
@@ -803,6 +992,20 @@ fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
     }
     window.add_action(&add);
 
+    let setup_action = gio::SimpleAction::new("setup", None);
+    {
+        let app = app.clone();
+        setup_action.connect_activate(move |_, _| open_setup(&app));
+    }
+    window.add_action(&setup_action);
+
+    let xlr_action = gio::SimpleAction::new("wave-xlr", None);
+    {
+        let app = app.clone();
+        xlr_action.connect_activate(move |_, _| open_wave_xlr(&app));
+    }
+    window.add_action(&xlr_action);
+
     let about = gio::SimpleAction::new("about", None);
     let win_weak = window.downgrade();
     about.connect_activate(move |_, _| {
@@ -835,8 +1038,8 @@ fn wire_close(app: &Rc<App>, window: &adw::ApplicationWindow) {
     window.connect_close_request(move |win| {
         app.config.borrow().save();
         win.set_visible(false);
-        if !notified.replace(true) {
-            if let Some(gapp) = win.application() {
+        if !notified.replace(true)
+            && let Some(gapp) = win.application() {
                 let note = gio::Notification::new("OpenWave is still running");
                 note.set_body(Some(
                     "The virtual audio devices stay active in the background. \
@@ -844,7 +1047,6 @@ fn wire_close(app: &Rc<App>, window: &adw::ApplicationWindow) {
                 ));
                 gapp.send_notification(Some("openwave-background"), &note);
             }
-        }
         glib::Propagation::Stop
     });
 }
