@@ -4,6 +4,6 @@
        resource base path under icons/, so they behave like theme icons
        (including symbolic recoloring). -->
   <gresource prefix="/de/ghostzero/OpenWave/icons/scalable/actions">
-    <file alias="sound-symbolic.svg">icons/sound-symbolic.svg</file>
+    <file alias="sound-wave-symbolic.svg">icons/sound-wave-symbolic.svg</file>
   </gresource>
 </gresources>

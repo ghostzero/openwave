@@ -83,7 +83,7 @@ impl ChannelStrip {
         remove.add_css_class("circular");
 
         let fx = gtk::Button::builder()
-            .icon_name("sound-symbolic")
+            .icon_name("sound-wave-symbolic")
             .tooltip_text("Effects")
             .valign(gtk::Align::Center)
             .build();
