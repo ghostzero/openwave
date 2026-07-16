@@ -48,13 +48,16 @@ struct DialogState {
     syncing: Cell<bool>,
 }
 
+/// Parameter updates from a plugin's native window:
+/// [(plugin cfg_id, param index, value)].
+pub type ParamSync = Rc<dyn Fn(&[(u64, u32, f64)])>;
+
 /// Hooks the window keeps for the open dialog.
 pub struct DialogHooks {
     /// Rebuild everything (a rack finished loading).
     pub refresh: Rc<dyn Fn()>,
-    /// Move parameter widgets to values edited in a plugin's native window:
-    /// [(plugin cfg_id, param index, value)].
-    pub sync_params: Rc<dyn Fn(&[(u64, u32, f64)])>,
+    /// Move parameter widgets to values edited in a plugin's native window.
+    pub sync_params: ParamSync,
 }
 
 /// Present the dialog; returns it together with the update hooks.
@@ -113,7 +116,7 @@ pub fn open(
         let state = state.clone();
         Rc::new(move || rebuild_groups(&state))
     };
-    let sync_params: Rc<dyn Fn(&[(u64, u32, f64)])> = {
+    let sync_params: ParamSync = {
         let state = state.clone();
         Rc::new(move |updates| {
             state.syncing.set(true);
@@ -339,11 +342,10 @@ fn control_change(
 ) {
     {
         let mut cfg = state.deps.config.borrow_mut();
-        if let Some(ch) = cfg.channel_mut(state.channel_id) {
-            if let Some(e) = ch.effect_mut(effect_id) {
+        if let Some(ch) = cfg.channel_mut(state.channel_id)
+            && let Some(e) = ch.effect_mut(effect_id) {
                 e.controls.insert(symbol.to_string(), value);
             }
-        }
     }
     (state.deps.on_control)(state.channel_id);
 
@@ -699,11 +701,10 @@ fn vst_param_change(state: &Rc<DialogState>, vst_id: u64, index: u32, value: f64
     }
     {
         let mut cfg = state.deps.config.borrow_mut();
-        if let Some(ch) = cfg.channel_mut(state.channel_id) {
-            if let Some(p) = ch.vst_mut(vst_id) {
+        if let Some(ch) = cfg.channel_mut(state.channel_id)
+            && let Some(p) = ch.vst_mut(vst_id) {
                 p.params.insert(index.to_string(), value);
             }
-        }
     }
     (state.deps.on_control)(state.channel_id);
 
@@ -759,7 +760,7 @@ fn open_vst_picker(state: &Rc<DialogState>) {
             list.remove(&scanning);
             if entries.is_empty() {
                 let row = adw::ActionRow::builder()
-                    .title("No VST plugins found")
+                    .title("No VST Plugins Found")
                     .subtitle(
                         "Searched ~/vst, ~/.vst, ~/.vst3, the system vst/vst3 \
                          folders, and $VST_PATH/$VST3_PATH.",

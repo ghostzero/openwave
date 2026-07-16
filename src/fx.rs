@@ -278,8 +278,8 @@ impl FxManager {
             return;
         };
         let mut fails = 0;
-        if let Some(c) = self.chains.get(&id) {
-            if c.conf == conf {
+        if let Some(c) = self.chains.get(&id)
+            && c.conf == conf {
                 if c.slot.running() {
                     return;
                 }
@@ -290,7 +290,6 @@ impl FxManager {
                     }
                 }
             }
-        }
         if let Some(c) = self.chains.remove(&id) {
             c.slot.kill();
         }
@@ -392,8 +391,8 @@ impl FxManager {
             .collect::<Vec<_>>()
             .join("\x1e");
         let mut fails = 0;
-        if let Some(s) = self.vsts.get(&id) {
-            if s.desc == desc {
+        if let Some(s) = self.vsts.get(&id)
+            && s.desc == desc {
                 if s.slot.running() {
                     return true;
                 }
@@ -404,7 +403,6 @@ impl FxManager {
                     }
                 }
             }
-        }
         self.kill_vst(id);
 
         let dir = fx_dir();
@@ -500,11 +498,10 @@ impl FxManager {
             let _ = writeln!(stdin, "{msg}");
         }
         // Mirror into the runtime cache so a dialog rebuild shows the value.
-        if let Some(rt) = slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id) {
-            if let Some(p) = rt.params.iter_mut().find(|p| p.index == index) {
+        if let Some(rt) = slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id)
+            && let Some(p) = rt.params.iter_mut().find(|p| p.index == index) {
                 p.value = value;
             }
-        }
     }
 
     /// Process a protocol line from a helper.
@@ -569,12 +566,10 @@ impl FxManager {
                     let index = index as u32;
                     if let Some(rt) =
                         slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id)
-                    {
-                        if let Some(p) = rt.params.iter_mut().find(|p| p.index == index)
+                        && let Some(p) = rt.params.iter_mut().find(|p| p.index == index)
                         {
                             p.value = value;
                         }
-                    }
                     outcome.params.push((cfg_id, index, value));
                 }
             }
@@ -644,11 +639,10 @@ impl FxManager {
                     None,
                     None::<&gio::Cancellable>,
                     move |res| {
-                        if let Ok((Some(out), _)) = res {
-                            if !out.contains("No such object") {
+                        if let Ok((Some(out), _)) = res
+                            && !out.contains("No such object") {
                                 done.set(true);
                             }
-                        }
                     },
                 );
             }

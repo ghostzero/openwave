@@ -209,12 +209,26 @@ impl Default for MasterConfig {
     }
 }
 
+/// Volume levels re-applied to an Elgato Wave XLR every time OpenWave starts
+/// (the device occasionally forgets its volume settings). Percentages 0–100;
+/// `None` = leave that control alone.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WaveXlrConfig {
+    pub mic_volume: Option<f64>,
+    pub output_volume: Option<f64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub next_channel_id: u64,
     pub channels: Vec<ChannelConfig>,
     pub master: MasterConfig,
+    /// The setup assistant was shown once; afterwards misconfigurations only
+    /// produce a notice instead of the full dialog.
+    pub setup_done: bool,
+    pub wave_xlr: WaveXlrConfig,
 }
 
 impl Default for Config {
@@ -237,6 +251,8 @@ impl Default for Config {
                 },
             ],
             master: MasterConfig::default(),
+            setup_done: false,
+            wave_xlr: WaveXlrConfig::default(),
         }
     }
 }
@@ -304,6 +320,8 @@ impl Config {
         cfg.next_channel_id = cfg.next_channel_id.max(max_id + 1);
         cfg.master.monitor_volume = cfg.master.monitor_volume.clamp(0.0, 1.0);
         cfg.master.stream_volume = cfg.master.stream_volume.clamp(0.0, 1.0);
+        cfg.wave_xlr.mic_volume = cfg.wave_xlr.mic_volume.map(|v| v.clamp(0.0, 100.0));
+        cfg.wave_xlr.output_volume = cfg.wave_xlr.output_volume.map(|v| v.clamp(0.0, 100.0));
         cfg
     }
 

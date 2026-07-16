@@ -3,10 +3,12 @@
 //! unavailable while the rest of the app (and previously configured chains,
 //! which PipeWire instantiates itself) keeps working.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::rc::Rc;
+use std::sync::{Condvar, Mutex};
 
+use gtk::glib;
 use libloading::Library;
 
 /// One input control port of a plugin.
@@ -219,7 +221,7 @@ fn build_catalog(api: &Api) -> Catalog {
                             CStr::from_ptr(p).to_string_lossy().into_owned()
                         }
                     };
-                    if !supported_uris.iter().any(|s| *s == furi) {
+                    if !supported_uris.contains(&furi) {
                         ok = false;
                     }
                 }
@@ -345,12 +347,24 @@ fn build_catalog(api: &Api) -> Catalog {
         // but keeping it alive is harmless and dropping it mid-session buys
         // nothing (lilv has no unload path for us to exercise safely).
     }
-    plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    plugins.sort_by_key(|a| a.name.to_lowercase());
     Catalog { plugins }
 }
 
+/// Warm-up scan handoff between the background thread and the main thread.
+enum ScanState {
+    NotStarted,
+    Running,
+    Done(Option<Catalog>),
+}
+
+static SCAN: Mutex<ScanState> = Mutex::new(ScanState::NotStarted);
+static SCAN_DONE: Condvar = Condvar::new();
+
 thread_local! {
     static CATALOG: OnceCell<Option<Rc<Catalog>>> = const { OnceCell::new() };
+    /// Work parked until the warm-up scan lands (see `when_ready`).
+    static PENDING: RefCell<Vec<Box<dyn FnOnce()>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Whether liblilv could be loaded at all (decides if the plugin browser is
@@ -359,10 +373,77 @@ pub fn available() -> bool {
     catalog().is_some()
 }
 
+/// Scan the LV2 world on a background thread so the first `catalog()` call
+/// doesn't freeze the UI (lilv parses every installed bundle synchronously).
+/// The result is handed back to the GTK main loop; while the scan runs,
+/// `scan_pending()` is true and catalog-dependent work can be parked with
+/// `when_ready`.
+pub fn warm() {
+    if CATALOG.with(|c| c.get().is_some()) {
+        return;
+    }
+    {
+        let mut st = SCAN.lock().unwrap();
+        if !matches!(*st, ScanState::NotStarted) {
+            return;
+        }
+        *st = ScanState::Running;
+    }
+    std::thread::spawn(|| {
+        let result = Api::load().map(|api| build_catalog(&api));
+        *SCAN.lock().unwrap() = ScanState::Done(result);
+        SCAN_DONE.notify_all();
+    });
+    glib::timeout_add_local(std::time::Duration::from_millis(50), || {
+        if matches!(*SCAN.lock().unwrap(), ScanState::Running) {
+            return glib::ControlFlow::Continue;
+        }
+        let _ = catalog(); // move the result into this thread's cache
+        let parked = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        for cb in parked {
+            cb();
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// True while the warm-up scan is still running, i.e. `catalog()` would
+/// block waiting for it.
+pub fn scan_pending() -> bool {
+    CATALOG.with(|c| c.get().is_none()) && matches!(*SCAN.lock().unwrap(), ScanState::Running)
+}
+
+/// Run `cb` on the main loop once the warm-up scan lands. Only meaningful
+/// right after a `scan_pending()` == true check on the main thread.
+pub fn when_ready(cb: impl FnOnce() + 'static) {
+    PENDING.with(|p| p.borrow_mut().push(Box::new(cb)));
+}
+
 /// The installed-plugin catalog, scanned once per process on first use.
+/// Blocks if the warm-up scan is still running; scans inline if none was
+/// started (e.g. the --list-lv2 CLI path).
 pub fn catalog() -> Option<Rc<Catalog>> {
     CATALOG.with(|c| {
-        c.get_or_init(|| Api::load().map(|api| Rc::new(build_catalog(&api))))
-            .clone()
+        c.get_or_init(|| {
+            let mut st = SCAN.lock().unwrap();
+            loop {
+                match &*st {
+                    ScanState::NotStarted => {
+                        drop(st);
+                        return Api::load().map(|api| Rc::new(build_catalog(&api)));
+                    }
+                    ScanState::Running => st = SCAN_DONE.wait(st).unwrap(),
+                    ScanState::Done(_) => {
+                        let ScanState::Done(result) =
+                            std::mem::replace(&mut *st, ScanState::NotStarted)
+                        else {
+                            unreachable!();
+                        };
+                        return result.map(Rc::new);
+                    }
+                }
+            }
+        })
+        .clone()
     })
 }

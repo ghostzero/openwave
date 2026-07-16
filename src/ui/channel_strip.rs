@@ -196,8 +196,8 @@ impl ChannelStrip {
         let mut labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
         let mut assigns: Vec<Option<Assignment>> = items.iter().map(|(_, a)| a.clone()).collect();
         let mut selected = assigns.iter().position(|a| a == current);
-        if selected.is_none() {
-            if let Some(a) = current {
+        if selected.is_none()
+            && let Some(a) = current {
                 let label = match a {
                     Assignment::Source { name } => format!("{name} (unavailable)"),
                     Assignment::App { name } => format!("{name} (not running)"),
@@ -207,7 +207,6 @@ impl ChannelStrip {
                 assigns.push(Some(a.clone()));
                 selected = Some(labels.len() - 1);
             }
-        }
         let selected = selected.unwrap_or(0) as u32;
         if *self.last_labels.borrow() == labels && self.input.selected() == selected {
             return;
