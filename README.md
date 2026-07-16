@@ -34,6 +34,11 @@ quietly, or hear a voice chat that never reaches your stream at all.
     `OpenWave: Voice Chat`, or set `OpenWave: System` as your system default
     output; OBS can also capture these devices directly ("Audio Output
     Capture (PulseAudio)").
+- **Per-channel effects**: insert a chain of **LV2 plugins** (noise gates,
+  compressors, EQs, …) on any input, edited directly in OpenWave with live
+  parameter control — plus an optional **Carla rack for VST2/VST3 plugins**.
+  Effects are applied before the monitor/stream split, so both mixes hear
+  the processed signal.
 - **Per-channel, per-mix volume and mute**, with optional fader linking.
 - **Master volume and mute** for both mixes, plus live level meters
   everywhere.
@@ -53,6 +58,18 @@ quietly, or hear a voice chat that never reaches your stream at all.
   current distributions.
 - **GTK 4.18+** and **libadwaita 1.8+**.
 - WirePlumber (or another PipeWire session manager).
+
+Optional, for effects:
+
+- **LV2 chains** need PipeWire's filter-chain LV2 support and the lilv
+  library — on Fedora: `sudo dnf install pipewire-module-filter-chain-lv2
+  lilv` — plus some LV2 plugins (`lsp-plugins-lv2` is a great start; the
+  RNNoise-based `noise-suppression-for-voice` is popular for microphones).
+  On Debian/Ubuntu the LV2 loader ships with PipeWire itself; install
+  `liblilv-0-0` and e.g. `lsp-plugins-lv2`.
+- **VST racks** need **Carla** (`sudo dnf install Carla` / `sudo apt
+  install carla`). Windows VSTs work through yabridge as usual, since the
+  rack is a regular Carla project.
 
 Build dependencies (Fedora):
 
@@ -89,6 +106,16 @@ everything again.
 5. Pick your headphones as the *Monitor Mix* output device in the Outputs
    section — and mix away.
 
+### Effects
+
+Click the puzzle-piece button on a channel strip to open its effects. *Add
+Effect…* lists your installed LV2 plugins; each effect can be reordered,
+bypassed, and tweaked with live parameter sliders. Enabling the **VST Rack**
+inserts a Carla instance in front of the LV2 chain — *Open* brings up
+Carla's window, where you add and configure VST plugins; save the rack
+there (Ctrl+S) and OpenWave restores it (headless) on the next start.
+Closing Carla's window simply bypasses the rack until you open it again.
+
 ## How it works
 
 OpenWave talks to PipeWire through the PulseAudio client API on the GTK main
@@ -99,6 +126,14 @@ device via a remap source, and drives the level meters with low-rate
 peak-detect streams. All streams carry unique names and opt out of
 session-manager volume/target restoring, so the routing stays exactly as
 configured.
+
+Effect chains run out-of-process: each channel with effects gets a small
+`pipewire -c` child hosting a `filter-chain` module (sink in, source out),
+generated from your chain at `~/.config/openwave/fx/`. Parameter changes are
+applied live via `pw-cli set-param`; a crashing plugin can't take OpenWave
+down, and the channel falls back to its direct wiring. The Carla rack is a
+separate child process wired in with `pw-link`; its project lives at
+`~/.config/openwave/carla/ch<id>.carxp`.
 
 ## License
 

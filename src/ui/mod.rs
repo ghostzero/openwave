@@ -1,4 +1,5 @@
 pub mod channel_strip;
+pub mod effects;
 pub mod outputs;
 pub mod sidebar;
 pub mod window;

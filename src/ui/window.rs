@@ -10,6 +10,7 @@ use crate::audio::{AudioEvent, LevelTarget, Mix, PulseManager};
 use crate::config::{Assignment, Config, MAX_CHANNELS};
 
 use super::channel_strip::ChannelStrip;
+use super::effects::{self, EffectsDeps};
 use super::heading_label;
 use super::outputs::OutputsPanel;
 use super::sidebar::Sidebar;
@@ -549,6 +550,42 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                 stream_scale.set_value(monitor_scale.value());
             }
             schedule_save(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        strip.fx.connect_clicked(move |btn| {
+            let on_structure = {
+                let app = app.clone();
+                Rc::new(move |id: u64| {
+                    app.manager.rebuild_channel(id);
+                    schedule_save(&app);
+                    update_sidebar(&app);
+                    let cfg = app.config.borrow();
+                    if let Some(ch) = cfg.channel(id) {
+                        if let Some((_, strip)) =
+                            app.strips.borrow().iter().find(|(cid, _)| *cid == id)
+                        {
+                            strip.update_fx_indicator(ch);
+                        }
+                    }
+                })
+            };
+            let on_control = {
+                let app = app.clone();
+                Rc::new(move |_id: u64| schedule_save(&app))
+            };
+            effects::open(
+                btn,
+                EffectsDeps {
+                    config: app.config.clone(),
+                    manager: app.manager.clone(),
+                    on_structure,
+                    on_control,
+                },
+                id,
+            );
         });
     }
 

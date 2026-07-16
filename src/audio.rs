@@ -32,6 +32,8 @@ use pulse::stream::{FlagSet as StreamFlagSet, PeekResult, Stream};
 use pulse::volume::{ChannelVolumes, Volume};
 
 use crate::config::{Assignment, Config};
+use crate::fx::{self, FxEvent, FxManager};
+use crate::lv2;
 
 pub const MONITOR_SINK: &str = "OpenWave_Monitor";
 pub const STREAM_SINK: &str = "OpenWave_Stream";
@@ -118,12 +120,28 @@ struct Loopback {
     target: String,
 }
 
+/// Wiring deferred until the channel's FX bridge nodes show up on the
+/// server (the filter-chain runs in a child process and appears
+/// asynchronously).
+struct PendingWire {
+    /// The channel's real input (capture source or `<sink>.monitor`).
+    source: String,
+    /// Route through the Carla rack (VSTIn sink → pw-links) first.
+    use_carla: bool,
+}
+
 #[derive(Default)]
 struct ChannelRuntime {
     /// Bumped on every rebuild so stale module-load callbacks can tell they
     /// lost the race and must unload what they just created.
     generation: u64,
     sink_module: Option<u32>,
+    /// Feeds the input into the FX bridge when effects are active.
+    input_loop: Loopback,
+    /// Null sink in front of the Carla rack (JACK clients are not valid
+    /// loopback targets, so the rack taps this sink's monitor via pw-link).
+    vstin_module: Option<u32>,
+    pending_wire: Option<PendingWire>,
     monitor_loop: Loopback,
     stream_loop: Loopback,
 }
@@ -143,6 +161,8 @@ struct Inner {
     default_sink: Option<String>,
     /// Per-channel runtime state, keyed by the channel's stable config id.
     channels: HashMap<u64, ChannelRuntime>,
+    /// Effect helper processes (filter chains, Carla racks).
+    fx: FxManager,
     monitor_out: Loopback,
     monitor_out_generation: u64,
     monitor_out_pending: bool,
@@ -168,9 +188,26 @@ impl PulseManager {
             config,
             ..Inner::default()
         };
-        Self {
-            inner: Rc::new(RefCell::new(inner)),
-        }
+        let rc = Rc::new(RefCell::new(inner));
+        let weak = Rc::downgrade(&rc);
+        rc.borrow_mut().fx.set_event_handler(move |ev| {
+            let Some(rc) = weak.upgrade() else {
+                return;
+            };
+            // Child-watch context: never called while Inner is borrowed.
+            match ev {
+                FxEvent::ChainDied(id) | FxEvent::CarlaDied(id) => {
+                    if rc.borrow().shutting_down {
+                        return;
+                    }
+                    // Rewire the channel around whatever is still running
+                    // (chain gone → direct, Carla gone → chain only).
+                    Self::rebuild_channel_inner(&rc, id);
+                    Self::emit(&rc, AudioEvent::DevicesChanged);
+                }
+            }
+        });
+        Self { inner: rc }
     }
 
     pub fn set_event_handler(&self, f: impl Fn(AudioEvent) + 'static) {
@@ -186,6 +223,7 @@ impl PulseManager {
             inner.shutting_down = false;
             inner.owned_modules.clear();
             inner.channels.clear();
+            inner.fx.shutdown_all();
             inner.monitor_out = Loopback::default();
             inner.monitor_out_pending = false;
             for (_, s) in inner.peaks.drain() {
@@ -258,6 +296,39 @@ impl PulseManager {
         Self::setup_monitor_output_inner(&self.inner);
     }
 
+    /// Push a control-port value into a channel's running filter chain
+    /// without rebuilding it. `mono` mirrors the value onto both per-lane
+    /// instances of a mono plugin.
+    pub fn set_effect_control(
+        &self,
+        channel: u64,
+        effect_id: u64,
+        mono: bool,
+        symbol: &str,
+        value: f64,
+    ) {
+        let inner = self.inner.borrow();
+        inner
+            .fx
+            .set_controls(channel, &fx::effect_labels(effect_id, mono), symbol, value);
+    }
+
+    pub fn carla_available(&self) -> bool {
+        FxManager::carla_available()
+    }
+
+    /// Open the channel's Carla rack with its editor window. If the rack
+    /// was not running yet the channel is rewired to include it; if it was
+    /// running headless it is restarted with the GUI and relinked.
+    pub fn open_carla(&self, id: u64) {
+        let was_running = self.inner.borrow_mut().fx.open_carla_gui(id);
+        if was_running {
+            self.inner.borrow_mut().fx.start_carla_links(id);
+        } else {
+            Self::rebuild_channel_inner(&self.inner, id);
+        }
+    }
+
     /// Unload everything we created on the server, then call `done`.
     pub fn shutdown(&self, done: Box<dyn Fn() + 'static>) {
         let rc = &self.inner;
@@ -265,6 +336,7 @@ impl PulseManager {
             let mut inner = rc.borrow_mut();
             inner.shutting_down = true;
             inner.ready = false;
+            inner.fx.shutdown_all();
             for (_, s) in inner.peaks.drain() {
                 let _ = s.borrow_mut().disconnect();
             }
@@ -653,6 +725,7 @@ impl PulseManager {
                 rc.borrow_mut().sink_inputs = acc.take();
                 Self::match_pending_loopbacks(&rc);
                 Self::reconcile_apps(&rc);
+                Self::check_pending_wires(&rc);
                 {
                     let inner = rc.borrow();
                     if inner.ready
@@ -676,6 +749,7 @@ impl PulseManager {
     /// back to our state because we only write on mismatch.
     fn match_pending_loopbacks(rc: &Rc<RefCell<Inner>>) {
         let mut applies: Vec<(Option<u64>, Mix)> = Vec::new();
+        let mut input_applies: Vec<u64> = Vec::new();
         let mut moves: Vec<(u32, String)> = Vec::new();
         {
             let mut inner = rc.borrow_mut();
@@ -686,14 +760,14 @@ impl PulseManager {
                 .collect();
             let ids: Vec<u64> = inner.channels.keys().copied().collect();
             for &id in &ids {
-                for mix in [Mix::Monitor, Mix::Stream] {
-                    let Some(rt) = inner.channels.get_mut(&id) else {
-                        continue;
-                    };
-                    let l = match mix {
-                        Mix::Monitor => &mut rt.monitor_loop,
-                        Mix::Stream => &mut rt.stream_loop,
-                    };
+                let Some(rt) = inner.channels.get_mut(&id) else {
+                    continue;
+                };
+                for l in [
+                    &mut rt.monitor_loop,
+                    &mut rt.stream_loop,
+                    &mut rt.input_loop,
+                ] {
                     if let (Some(m), None) = (l.module, l.sink_input) {
                         if let Some(&(si, chans)) = by_module.get(&m) {
                             l.sink_input = Some(si);
@@ -738,6 +812,11 @@ impl PulseManager {
                     Self::check_drift(&inner, l, vol, mute, &sink_names, &mut moves)
                         .then(|| applies.push((Some(c.id), mix)));
                 }
+                // The FX input loopback always runs at unity gain.
+                if Self::check_drift(&inner, &rt.input_loop, 1.0, false, &sink_names, &mut moves)
+                {
+                    input_applies.push(c.id);
+                }
             }
             if Self::check_drift(
                 &inner,
@@ -763,6 +842,29 @@ impl PulseManager {
                 None => Self::apply_master_monitor_inner(rc),
             }
         }
+        for id in input_applies {
+            Self::apply_input_loop_inner(rc, id);
+        }
+    }
+
+    /// Re-assert unity gain on a channel's FX input loopback.
+    fn apply_input_loop_inner(rc: &Rc<RefCell<Inner>>, id: u64) {
+        let params = {
+            let inner = rc.borrow();
+            inner
+                .channels
+                .get(&id)
+                .and_then(|rt| rt.input_loop.sink_input.map(|si| (si, rt.input_loop.channels)))
+        };
+        let Some((si, chans)) = params else {
+            return;
+        };
+        let Some(mut intro) = Self::introspect(rc) else {
+            return;
+        };
+        let cv = volume_cv(chans, 1.0);
+        let _ = intro.set_sink_input_volume(si, &cv, None);
+        let _ = intro.set_sink_input_mute(si, false, None);
     }
 
     /// Returns true when volume/mute must be re-applied; queues a move when
@@ -851,6 +953,7 @@ impl PulseManager {
             let rt = inner.channels.entry(id).or_default();
             rt.generation += 1;
             let generation_id = rt.generation;
+            rt.pending_wire = None;
             let mut to_unload = Vec::new();
             if let Some(m) = rt.monitor_loop.module.take() {
                 to_unload.push(m);
@@ -860,6 +963,13 @@ impl PulseManager {
                 to_unload.push(m);
             }
             rt.stream_loop.sink_input = None;
+            if let Some(m) = rt.input_loop.module.take() {
+                to_unload.push(m);
+            }
+            rt.input_loop.sink_input = None;
+            if let Some(m) = rt.vstin_module.take() {
+                to_unload.push(m);
+            }
             if let Some(m) = rt.sink_module.take() {
                 to_unload.push(m);
             }
@@ -878,6 +988,7 @@ impl PulseManager {
                 // Channel was removed; stale module callbacks detect the
                 // missing runtime entry and clean up after themselves.
                 inner.channels.remove(&id);
+                inner.fx.remove_channel(id);
             }
             let active = inner.ready && !inner.shutting_down;
             (channel_cfg, generation_id, to_unload, active)
@@ -895,10 +1006,13 @@ impl PulseManager {
             return;
         };
         match assignment {
-            None => {}
+            None => {
+                let mut inner = rc.borrow_mut();
+                inner.fx.ensure_chain(id, None);
+                inner.fx.kill_carla(id);
+            }
             Some(Assignment::Source { name }) => {
-                Self::create_channel_loopbacks(rc, id, generation_id, &name);
-                Self::create_peak(rc, LevelTarget::Channel(id), &name);
+                Self::wire_channel_input(rc, id, generation_id, &name);
             }
             // App channels and standalone virtual channels both expose a
             // selectable device named after the channel; apps can be routed
@@ -948,12 +1062,237 @@ impl PulseManager {
                         }
                     }
                     let monitor = format!("{sink_name}.monitor");
-                    Self::create_channel_loopbacks(&rc, id, generation_id, &monitor);
-                    Self::create_peak(&rc, LevelTarget::Channel(id), &monitor);
+                    Self::wire_channel_input(&rc, id, generation_id, &monitor);
                     Self::schedule_refresh(&rc);
                 });
             }
         }
+    }
+
+    /// Route a channel's input either straight into the mix loopbacks or
+    /// through its FX bridge (Carla rack and/or LV2 filter chain). `source`
+    /// is the channel's real input: a capture source or `<sink>.monitor`.
+    fn wire_channel_input(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64, source: &str) {
+        let (conf, vst_rack) = {
+            let inner = rc.borrow();
+            let cfg = inner.config.borrow();
+            let Some(c) = cfg.channel(id) else {
+                return;
+            };
+            (fx::chain_conf(id, c, lv2::catalog().as_deref()), c.vst_rack)
+        };
+        let Some(conf) = conf else {
+            // No active effects: the classic direct wiring.
+            {
+                let mut inner = rc.borrow_mut();
+                inner.fx.ensure_chain(id, None);
+                inner.fx.kill_carla(id);
+            }
+            Self::create_channel_loopbacks(rc, id, generation_id, source);
+            Self::create_peak(rc, LevelTarget::Channel(id), source);
+            return;
+        };
+        let use_carla = {
+            let mut inner = rc.borrow_mut();
+            let use_carla = if vst_rack {
+                inner.fx.ensure_carla(id)
+            } else {
+                inner.fx.kill_carla(id);
+                false
+            };
+            inner.fx.ensure_chain(id, Some(conf));
+            if let Some(rt) = inner.channels.get_mut(&id) {
+                if rt.generation != generation_id {
+                    return;
+                }
+                rt.pending_wire = Some(PendingWire {
+                    source: source.to_string(),
+                    use_carla,
+                });
+            }
+            use_carla
+        };
+        if use_carla {
+            Self::create_vstin_sink(rc, id, generation_id);
+        }
+        // The bridge nodes appear asynchronously; check_pending_wires picks
+        // the channel up on the next device refresh.
+        Self::schedule_refresh(rc);
+    }
+
+    /// Null sink whose monitor feeds the Carla rack (via pw-link).
+    fn create_vstin_sink(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64) {
+        let Some(mut intro) = Self::introspect(rc) else {
+            return;
+        };
+        let sink_name = fx::vstin_sink_name(id);
+        let args = format!(
+            "sink_name={sink_name} sink_properties='device.description=\"OpenWave Ch {id} VST In (internal)\"'"
+        );
+        let weak = Rc::downgrade(rc);
+        let _ = intro.load_module("module-null-sink", &args, move |idx| {
+            let Some(rc) = weak.upgrade() else {
+                return;
+            };
+            if idx == INVALID_INDEX {
+                return;
+            }
+            let stale = {
+                let inner = rc.borrow();
+                inner
+                    .channels
+                    .get(&id)
+                    .is_none_or(|rt| rt.generation != generation_id)
+                    || inner.shutting_down
+            };
+            if stale {
+                if let Some(mut intro) = Self::introspect(&rc) {
+                    let _ = intro.unload_module(idx, |_| {});
+                }
+                return;
+            }
+            let mut inner = rc.borrow_mut();
+            inner.owned_modules.insert(idx);
+            if let Some(rt) = inner.channels.get_mut(&id) {
+                rt.vstin_module = Some(idx);
+            }
+            drop(inner);
+            Self::schedule_refresh(&rc);
+        });
+    }
+
+    /// Wire every channel whose FX bridge nodes have appeared on the server
+    /// (or whose chain has died, in which case it falls back to the direct
+    /// path so the channel is never left silent).
+    fn check_pending_wires(rc: &Rc<RefCell<Inner>>) {
+        struct Ready {
+            id: u64,
+            generation: u64,
+            source: String,
+            use_carla: bool,
+            direct: bool,
+        }
+        let ready: Vec<Ready> = {
+            let inner = rc.borrow();
+            if !inner.ready || inner.shutting_down {
+                return;
+            }
+            let sink_set: HashSet<&str> =
+                inner.sinks.iter().map(|(_, e)| e.name.as_str()).collect();
+            let source_set: HashSet<&str> =
+                inner.sources.iter().map(|s| s.name.as_str()).collect();
+            let mut v = Vec::new();
+            for (&id, rt) in &inner.channels {
+                let Some(p) = &rt.pending_wire else {
+                    continue;
+                };
+                if inner.fx.chain_failed(id) {
+                    v.push(Ready {
+                        id,
+                        generation: rt.generation,
+                        source: p.source.clone(),
+                        use_carla: false,
+                        direct: true,
+                    });
+                    continue;
+                }
+                if !sink_set.contains(fx::chain_sink_name(id).as_str())
+                    || !source_set.contains(fx::chain_source_name(id).as_str())
+                {
+                    continue;
+                }
+                let use_carla = p.use_carla && inner.fx.carla_running(id);
+                if use_carla && !sink_set.contains(fx::vstin_sink_name(id).as_str()) {
+                    continue;
+                }
+                v.push(Ready {
+                    id,
+                    generation: rt.generation,
+                    source: p.source.clone(),
+                    use_carla,
+                    direct: false,
+                });
+            }
+            v
+        };
+        for r in ready {
+            {
+                let mut inner = rc.borrow_mut();
+                let Some(rt) = inner.channels.get_mut(&r.id) else {
+                    continue;
+                };
+                if rt.generation != r.generation {
+                    continue;
+                }
+                rt.pending_wire = None;
+            }
+            if r.direct {
+                Self::create_channel_loopbacks(rc, r.id, r.generation, &r.source);
+                Self::create_peak(rc, LevelTarget::Channel(r.id), &r.source);
+                continue;
+            }
+            let bridge_in = if r.use_carla {
+                fx::vstin_sink_name(r.id)
+            } else {
+                fx::chain_sink_name(r.id)
+            };
+            let post = fx::chain_source_name(r.id);
+            Self::create_input_loopback(rc, r.id, r.generation, &r.source, &bridge_in);
+            Self::create_channel_loopbacks(rc, r.id, r.generation, &post);
+            Self::create_peak(rc, LevelTarget::Channel(r.id), &post);
+            if r.use_carla {
+                rc.borrow_mut().fx.start_carla_links(r.id);
+            }
+        }
+    }
+
+    /// Unity-gain loopback feeding the channel input into the FX bridge.
+    fn create_input_loopback(
+        rc: &Rc<RefCell<Inner>>,
+        id: u64,
+        generation_id: u64,
+        source: &str,
+        sink: &str,
+    ) {
+        let Some(mut intro) = Self::introspect(rc) else {
+            return;
+        };
+        let tag = format!("OpenWave ch{id} fx-in");
+        let args = loopback_args(source, sink, &tag);
+        let sink = sink.to_string();
+        let weak = Rc::downgrade(rc);
+        let _ = intro.load_module("module-loopback", &args, move |idx| {
+            let Some(rc) = weak.upgrade() else {
+                return;
+            };
+            if idx == INVALID_INDEX {
+                return;
+            }
+            let stale = {
+                let inner = rc.borrow();
+                inner
+                    .channels
+                    .get(&id)
+                    .is_none_or(|rt| rt.generation != generation_id)
+                    || inner.shutting_down
+            };
+            if stale {
+                if let Some(mut intro) = Self::introspect(&rc) {
+                    let _ = intro.unload_module(idx, |_| {});
+                }
+                return;
+            }
+            {
+                let mut inner = rc.borrow_mut();
+                inner.owned_modules.insert(idx);
+                if let Some(rt) = inner.channels.get_mut(&id) {
+                    rt.input_loop.module = Some(idx);
+                    rt.input_loop.sink_input = None;
+                    rt.input_loop.target = sink.clone();
+                }
+            }
+            Self::schedule_refresh(&rc);
+        });
     }
 
     fn create_channel_loopbacks(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64, source: &str) {

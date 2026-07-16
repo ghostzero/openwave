@@ -17,6 +17,7 @@ pub struct ChannelStrip {
     pub root: gtk::Box,
     pub name: gtk::EditableLabel,
     pub remove: gtk::Button,
+    pub fx: gtk::Button,
     pub input: gtk::DropDown,
     pub level: gtk::LevelBar,
     pub monitor_scale: gtk::Scale,
@@ -81,8 +82,17 @@ impl ChannelStrip {
         remove.add_css_class("flat");
         remove.add_css_class("circular");
 
+        let fx = gtk::Button::builder()
+            .icon_name("application-x-addon-symbolic")
+            .tooltip_text("Effects")
+            .valign(gtk::Align::Center)
+            .build();
+        fx.add_css_class("flat");
+        fx.add_css_class("circular");
+
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         header.append(&name);
+        header.append(&fx);
         header.append(&remove);
 
         let input = gtk::DropDown::builder()
@@ -124,6 +134,7 @@ impl ChannelStrip {
             root,
             name,
             remove,
+            fx,
             input,
             level,
             monitor_scale,
@@ -147,7 +158,31 @@ impl ChannelStrip {
         self.monitor_mute.set_active(c.monitor_muted);
         self.stream_mute.set_active(c.stream_muted);
         self.link.set_active(c.linked);
+        self.update_fx_indicator(c);
         self.guard.set(false);
+    }
+
+    /// Tint the FX button while the channel processes through effects.
+    pub fn update_fx_indicator(&self, c: &ChannelConfig) {
+        let enabled = c.effects.iter().filter(|e| e.enabled).count();
+        let active = c.fx_active();
+        if active {
+            self.fx.add_css_class("accent");
+        } else {
+            self.fx.remove_css_class("accent");
+        }
+        let mut tip = String::from("Effects");
+        let mut parts = Vec::new();
+        if enabled > 0 {
+            parts.push(format!("{enabled} LV2"));
+        }
+        if c.vst_rack {
+            parts.push("VST rack".to_string());
+        }
+        if !parts.is_empty() {
+            tip = format!("Effects ({} active)", parts.join(" + "));
+        }
+        self.fx.set_tooltip_text(Some(&tip));
     }
 
     /// Rebuild the input drop-down. `current` is kept selected; if it is not

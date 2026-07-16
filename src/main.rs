@@ -1,5 +1,7 @@
 mod audio;
 mod config;
+mod fx;
+mod lv2;
 mod ui;
 
 use std::cell::Cell;
@@ -20,10 +22,34 @@ fn main() -> glib::ExitCode {
         "Start with the window hidden (used by autostart)",
         None,
     );
+    app.add_main_option(
+        "list-lv2",
+        glib::Char::from(0u8),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "List usable LV2 plugins and exit (diagnostic)",
+        None,
+    );
     let start_hidden = Rc::new(Cell::new(false));
     {
         let start_hidden = start_hidden.clone();
         app.connect_handle_local_options(move |_, options| {
+            if options.contains("list-lv2") {
+                match lv2::catalog() {
+                    Some(cat) => {
+                        for p in &cat.plugins {
+                            let ch = if p.is_mono() { "mono" } else { "stereo" };
+                            println!("{} [{ch}, {} controls]\n    {}", p.name, p.controls.len(), p.uri);
+                        }
+                        eprintln!("{} usable plugins", cat.plugins.len());
+                        return std::ops::ControlFlow::Break(glib::ExitCode::SUCCESS);
+                    }
+                    None => {
+                        eprintln!("liblilv could not be loaded");
+                        return std::ops::ControlFlow::Break(glib::ExitCode::FAILURE);
+                    }
+                }
+            }
             if options.contains("hidden") {
                 start_hidden.set(true);
             }
