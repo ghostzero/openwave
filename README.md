@@ -34,11 +34,11 @@ quietly, or hear a voice chat that never reaches your stream at all.
     `OpenWave: Voice Chat`, or set `OpenWave: System` as your system default
     output; OBS can also capture these devices directly ("Audio Output
     Capture (PulseAudio)").
-- **Per-channel effects**: insert a chain of **LV2 plugins** (noise gates,
-  compressors, EQs, …) on any input, edited directly in OpenWave with live
-  parameter control — plus an optional **Carla rack for VST2/VST3 plugins**.
-  Effects are applied before the monitor/stream split, so both mixes hear
-  the processed signal.
+- **Per-channel effects**: insert **VST2/VST3 and LV2 plugins** (noise
+  suppression, gates, compressors, EQs, …) on any input — browsed, ordered,
+  bypassed, and tweaked with live parameter sliders entirely inside
+  OpenWave's own UI. Effects are applied before the monitor/stream split,
+  so both mixes hear the processed signal.
 - **Per-channel, per-mix volume and mute**, with optional fader linking.
 - **Master volume and mute** for both mixes, plus live level meters
   everywhere.
@@ -67,9 +67,11 @@ Optional, for effects:
   RNNoise-based `noise-suppression-for-voice` is popular for microphones).
   On Debian/Ubuntu the LV2 loader ships with PipeWire itself; install
   `liblilv-0-0` and e.g. `lsp-plugins-lv2`.
-- **VST racks** need **Carla** (`sudo dnf install Carla` / `sudo apt
-  install carla`). Windows VSTs work through yabridge as usual, since the
-  rack is a regular Carla project.
+- **VST plugins** need **Carla** (`sudo dnf install Carla` / `sudo apt
+  install carla`) and Python 3: OpenWave hosts VSTs headlessly through
+  Carla's engine library — you never see or use Carla itself. Plugins are
+  discovered in `~/vst`, `~/.vst`, `~/.lxvst`, `~/.vst3`, the system
+  `vst`/`vst3` folders, and `$VST_PATH`/`$VST3_PATH`.
 
 Build dependencies (Fedora):
 
@@ -108,13 +110,12 @@ everything again.
 
 ### Effects
 
-Click the puzzle-piece button on a channel strip to open its effects. *Add
-Effect…* lists your installed LV2 plugins; each effect can be reordered,
-bypassed, and tweaked with live parameter sliders. Enabling the **VST Rack**
-inserts a Carla instance in front of the LV2 chain — *Open* brings up
-Carla's window, where you add and configure VST plugins; save the rack
-there (Ctrl+S) and OpenWave restores it (headless) on the next start.
-Closing Carla's window simply bypasses the rack until you open it again.
+Click the puzzle-piece button on a channel strip to open its effects.
+*Add VST Plugin…* lists the VST2/VST3 plugins found in your plugin folders;
+*Add Effect…* lists your installed LV2 plugins. Every plugin can be
+reordered, bypassed, and tweaked with live parameter sliders right in the
+dialog — no external plugin host UI. The VST rack processes first, then the
+LV2 chain; everything is restored automatically on the next start.
 
 ## How it works
 
@@ -129,11 +130,13 @@ configured.
 
 Effect chains run out-of-process: each channel with effects gets a small
 `pipewire -c` child hosting a `filter-chain` module (sink in, source out),
-generated from your chain at `~/.config/openwave/fx/`. Parameter changes are
-applied live via `pw-cli set-param`; a crashing plugin can't take OpenWave
-down, and the channel falls back to its direct wiring. The Carla rack is a
-separate child process wired in with `pw-link`; its project lives at
-`~/.config/openwave/carla/ch<id>.carxp`.
+generated from your chain at `~/.config/openwave/fx/`. LV2 parameter changes
+are applied live via `pw-cli set-param`. VST plugins are hosted by another
+helper child (`vsthost.py`, driving Carla's engine library headlessly over a
+JSON pipe) that appears as a JACK client and is wired in with `pw-link`;
+plugins are probed once with `carla-discovery-native` and cached in
+`~/.cache/openwave/vst-scan.json`. A crashing plugin can't take OpenWave
+down — the channel falls back to its direct wiring.
 
 ## License
 

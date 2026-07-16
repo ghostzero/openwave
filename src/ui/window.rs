@@ -30,6 +30,9 @@ struct App {
     save_pending: Cell<bool>,
     /// Per-channel edit counter used to debounce rename → sink rebuild.
     rename_epoch: RefCell<HashMap<u64, u64>>,
+    /// The open effects dialog (channel id + refresh hook), so VST rack
+    /// load results can update it live.
+    fx_dialog: RefCell<Option<(u64, Rc<dyn Fn()>)>>,
     /// Forces every strip and the add-channel card to the same width.
     strip_size_group: gtk::SizeGroup,
 }
@@ -186,6 +189,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         error_page,
         save_pending: Cell::new(false),
         rename_epoch: RefCell::new(HashMap::new()),
+        fx_dialog: RefCell::new(None),
         strip_size_group,
     });
 
@@ -248,6 +252,17 @@ fn wire_audio_events(app: &Rc<App>) {
                 LevelTarget::MonitorMix => app.outputs.monitor_level.set_value(v),
                 LevelTarget::StreamMix => app.outputs.stream_level.set_value(v),
             },
+            AudioEvent::VstChanged(id) => {
+                let refresh = app
+                    .fx_dialog
+                    .borrow()
+                    .as_ref()
+                    .filter(|(did, _)| *did == id)
+                    .map(|(_, r)| r.clone());
+                if let Some(refresh) = refresh {
+                    refresh();
+                }
+            }
         }
     });
 }
@@ -576,7 +591,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                 let app = app.clone();
                 Rc::new(move |_id: u64| schedule_save(&app))
             };
-            effects::open(
+            let (dialog, refresh) = effects::open(
                 btn,
                 EffectsDeps {
                     config: app.config.clone(),
@@ -586,6 +601,14 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                 },
                 id,
             );
+            *app.fx_dialog.borrow_mut() = Some((id, refresh));
+            let app = app.clone();
+            dialog.connect_closed(move |_| {
+                let mut open = app.fx_dialog.borrow_mut();
+                if open.as_ref().is_some_and(|(did, _)| *did == id) {
+                    *open = None;
+                }
+            });
         });
     }
 

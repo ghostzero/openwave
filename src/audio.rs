@@ -85,6 +85,8 @@ pub enum AudioEvent {
     Failed(String),
     DevicesChanged,
     Level(LevelTarget, f64),
+    /// A channel's VST rack finished (re)loading; parameter info changed.
+    VstChanged(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -126,8 +128,8 @@ struct Loopback {
 struct PendingWire {
     /// The channel's real input (capture source or `<sink>.monitor`).
     source: String,
-    /// Route through the Carla rack (VSTIn sink → pw-links) first.
-    use_carla: bool,
+    /// Route through the VST rack (VSTIn sink → pw-links) first.
+    use_vst: bool,
 }
 
 #[derive(Default)]
@@ -194,16 +196,22 @@ impl PulseManager {
             let Some(rc) = weak.upgrade() else {
                 return;
             };
-            // Child-watch context: never called while Inner is borrowed.
+            // Child-watch/pipe context: never called while Inner is borrowed.
             match ev {
-                FxEvent::ChainDied(id) | FxEvent::CarlaDied(id) => {
+                FxEvent::ChainDied(id) | FxEvent::VstHostDied(id) => {
                     if rc.borrow().shutting_down {
                         return;
                     }
                     // Rewire the channel around whatever is still running
-                    // (chain gone → direct, Carla gone → chain only).
+                    // (chain gone → direct, VST host gone → chain only).
                     Self::rebuild_channel_inner(&rc, id);
                     Self::emit(&rc, AudioEvent::DevicesChanged);
+                }
+                FxEvent::VstReply(id, line) => {
+                    let changed = rc.borrow_mut().fx.handle_vst_reply(id, &line);
+                    if changed {
+                        Self::emit(&rc, AudioEvent::VstChanged(id));
+                    }
                 }
             }
         });
@@ -227,7 +235,7 @@ impl PulseManager {
             inner.monitor_out = Loopback::default();
             inner.monitor_out_pending = false;
             for (_, s) in inner.peaks.drain() {
-                let _ = s.borrow_mut().disconnect();
+                Self::drop_peak(&s);
             }
             inner.sinks.clear();
             inner.sources.clear();
@@ -313,20 +321,18 @@ impl PulseManager {
             .set_controls(channel, &fx::effect_labels(effect_id, mono), symbol, value);
     }
 
-    pub fn carla_available(&self) -> bool {
-        FxManager::carla_available()
+    /// Runtime state (load status + parameters) of a channel's VST rack.
+    pub fn vst_runtime(&self, id: u64) -> Vec<fx::VstRuntime> {
+        self.inner.borrow().fx.vst_runtime(id)
     }
 
-    /// Open the channel's Carla rack with its editor window. If the rack
-    /// was not running yet the channel is rewired to include it; if it was
-    /// running headless it is restarted with the GUI and relinked.
-    pub fn open_carla(&self, id: u64) {
-        let was_running = self.inner.borrow_mut().fx.open_carla_gui(id);
-        if was_running {
-            self.inner.borrow_mut().fx.start_carla_links(id);
-        } else {
-            Self::rebuild_channel_inner(&self.inner, id);
-        }
+    /// Push a parameter value into a channel's running VST rack without
+    /// rebuilding anything.
+    pub fn set_vst_param(&self, channel: u64, cfg_id: u64, index: u32, value: f64) {
+        self.inner
+            .borrow_mut()
+            .fx
+            .set_vst_param(channel, cfg_id, index, value);
     }
 
     /// Unload everything we created on the server, then call `done`.
@@ -338,7 +344,7 @@ impl PulseManager {
             inner.ready = false;
             inner.fx.shutdown_all();
             for (_, s) in inner.peaks.drain() {
-                let _ = s.borrow_mut().disconnect();
+                Self::drop_peak(&s);
             }
             inner.owned_modules.drain().collect()
         };
@@ -428,6 +434,17 @@ impl PulseManager {
         Self::emit(rc, AudioEvent::Failed(msg.to_string()));
     }
 
+    /// Detach a peak stream so it can be dropped safely. The read callback
+    /// must be cleared first: libpulse may still hold queued events for the
+    /// stream, and dispatching one into the freed closure after the Rust
+    /// wrapper is gone crashes with a wild jump (observed as SIGSEGV in
+    /// do_read/request_cb_proxy when a metered source vanishes mid-rebuild).
+    fn drop_peak(stream: &Rc<RefCell<Stream>>) {
+        let mut s = stream.borrow_mut();
+        s.set_read_callback(None);
+        let _ = s.disconnect();
+    }
+
     fn introspect(
         rc: &Rc<RefCell<Inner>>,
     ) -> Option<pulse::context::introspect::Introspector> {
@@ -513,12 +530,30 @@ impl PulseManager {
                     return;
                 };
                 let mods = found.take();
-                if let Some(mut intro) = Self::introspect(&rc) {
-                    for m in mods {
-                        let _ = intro.unload_module(m, |_| {});
-                    }
+                let Some(mut intro) = Self::introspect(&rc) else {
+                    return;
+                };
+                if mods.is_empty() {
+                    Self::create_virtual_sinks(&rc);
+                    return;
                 }
-                Self::create_virtual_sinks(&rc);
+                // Wait for every unload to finish before creating the new
+                // buses: a leftover sink with the same name would win the
+                // race, and our meters/loopbacks (which attach by name)
+                // would bind to the doomed node and die with it.
+                let remaining = Rc::new(Cell::new(mods.len()));
+                for m in mods {
+                    let weak = weak.clone();
+                    let remaining = remaining.clone();
+                    let _ = intro.unload_module(m, move |_| {
+                        remaining.set(remaining.get().saturating_sub(1));
+                        if remaining.get() == 0 {
+                            if let Some(rc) = weak.upgrade() {
+                                Self::create_virtual_sinks(&rc);
+                            }
+                        }
+                    });
+                }
             }
         });
     }
@@ -977,7 +1012,7 @@ impl PulseManager {
                 inner.owned_modules.remove(m);
             }
             if let Some(s) = inner.peaks.remove(&LevelTarget::Channel(id)) {
-                let _ = s.borrow_mut().disconnect();
+                Self::drop_peak(&s);
             }
             let channel_cfg = inner
                 .config
@@ -1009,7 +1044,7 @@ impl PulseManager {
             None => {
                 let mut inner = rc.borrow_mut();
                 inner.fx.ensure_chain(id, None);
-                inner.fx.kill_carla(id);
+                inner.fx.kill_vst(id);
             }
             Some(Assignment::Source { name }) => {
                 Self::wire_channel_input(rc, id, generation_id, &name);
@@ -1073,33 +1108,28 @@ impl PulseManager {
     /// through its FX bridge (Carla rack and/or LV2 filter chain). `source`
     /// is the channel's real input: a capture source or `<sink>.monitor`.
     fn wire_channel_input(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64, source: &str) {
-        let (conf, vst_rack) = {
+        let (conf, channel_cfg) = {
             let inner = rc.borrow();
             let cfg = inner.config.borrow();
             let Some(c) = cfg.channel(id) else {
                 return;
             };
-            (fx::chain_conf(id, c, lv2::catalog().as_deref()), c.vst_rack)
+            (fx::chain_conf(id, c, lv2::catalog().as_deref()), c.clone())
         };
         let Some(conf) = conf else {
             // No active effects: the classic direct wiring.
             {
                 let mut inner = rc.borrow_mut();
                 inner.fx.ensure_chain(id, None);
-                inner.fx.kill_carla(id);
+                inner.fx.kill_vst(id);
             }
             Self::create_channel_loopbacks(rc, id, generation_id, source);
             Self::create_peak(rc, LevelTarget::Channel(id), source);
             return;
         };
-        let use_carla = {
+        let use_vst = {
             let mut inner = rc.borrow_mut();
-            let use_carla = if vst_rack {
-                inner.fx.ensure_carla(id)
-            } else {
-                inner.fx.kill_carla(id);
-                false
-            };
+            let use_vst = inner.fx.ensure_vst_host(id, &channel_cfg);
             inner.fx.ensure_chain(id, Some(conf));
             if let Some(rt) = inner.channels.get_mut(&id) {
                 if rt.generation != generation_id {
@@ -1107,12 +1137,12 @@ impl PulseManager {
                 }
                 rt.pending_wire = Some(PendingWire {
                     source: source.to_string(),
-                    use_carla,
+                    use_vst,
                 });
             }
-            use_carla
+            use_vst
         };
-        if use_carla {
+        if use_vst {
             Self::create_vstin_sink(rc, id, generation_id);
         }
         // The bridge nodes appear asynchronously; check_pending_wires picks
@@ -1169,7 +1199,7 @@ impl PulseManager {
             id: u64,
             generation: u64,
             source: String,
-            use_carla: bool,
+            use_vst: bool,
             direct: bool,
         }
         let ready: Vec<Ready> = {
@@ -1191,7 +1221,7 @@ impl PulseManager {
                         id,
                         generation: rt.generation,
                         source: p.source.clone(),
-                        use_carla: false,
+                        use_vst: false,
                         direct: true,
                     });
                     continue;
@@ -1201,15 +1231,15 @@ impl PulseManager {
                 {
                     continue;
                 }
-                let use_carla = p.use_carla && inner.fx.carla_running(id);
-                if use_carla && !sink_set.contains(fx::vstin_sink_name(id).as_str()) {
+                let use_vst = p.use_vst && inner.fx.vst_running(id);
+                if use_vst && !sink_set.contains(fx::vstin_sink_name(id).as_str()) {
                     continue;
                 }
                 v.push(Ready {
                     id,
                     generation: rt.generation,
                     source: p.source.clone(),
-                    use_carla,
+                    use_vst,
                     direct: false,
                 });
             }
@@ -1231,7 +1261,7 @@ impl PulseManager {
                 Self::create_peak(rc, LevelTarget::Channel(r.id), &r.source);
                 continue;
             }
-            let bridge_in = if r.use_carla {
+            let bridge_in = if r.use_vst {
                 fx::vstin_sink_name(r.id)
             } else {
                 fx::chain_sink_name(r.id)
@@ -1240,8 +1270,8 @@ impl PulseManager {
             Self::create_input_loopback(rc, r.id, r.generation, &r.source, &bridge_in);
             Self::create_channel_loopbacks(rc, r.id, r.generation, &post);
             Self::create_peak(rc, LevelTarget::Channel(r.id), &post);
-            if r.use_carla {
-                rc.borrow_mut().fx.start_carla_links(r.id);
+            if r.use_vst {
+                rc.borrow_mut().fx.start_vst_links(r.id);
             }
         }
     }
@@ -1490,6 +1520,9 @@ impl PulseManager {
             let mut inner = rc.borrow_mut();
             if !inner.ready || inner.shutting_down {
                 return;
+            }
+            if let Some(old) = inner.peaks.remove(&target) {
+                Self::drop_peak(&old);
             }
             let Some(ctx) = inner.context.as_mut() else {
                 return;

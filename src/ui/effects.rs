@@ -6,11 +6,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 
 use crate::audio::PulseManager;
 use crate::config::Config;
+use crate::fx::{VstParamInfo, VstState};
 use crate::lv2;
+use crate::vst;
 
 /// Everything the dialog needs from the main window.
 pub struct EffectsDeps {
@@ -34,7 +36,13 @@ struct DialogState {
     control_debounce: RefCell<Option<glib::SourceId>>,
 }
 
-pub fn open(parent: &impl IsA<gtk::Widget>, deps: EffectsDeps, channel_id: u64) {
+/// Present the dialog; returns it together with a refresh closure the
+/// window calls when a rack finishes loading (AudioEvent::VstChanged).
+pub fn open(
+    parent: &impl IsA<gtk::Widget>,
+    deps: EffectsDeps,
+    channel_id: u64,
+) -> (adw::Dialog, Rc<dyn Fn()>) {
     let channel_name = deps
         .config
         .borrow()
@@ -48,7 +56,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, deps: EffectsDeps, channel_id: u64) 
     content.set_margin_start(16);
     content.set_margin_end(16);
 
-    let effects_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let effects_box = gtk::Box::new(gtk::Orientation::Vertical, 24);
     content.append(&effects_box);
 
     let dialog = adw::Dialog::builder()
@@ -65,8 +73,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, deps: EffectsDeps, channel_id: u64) 
         control_debounce: RefCell::new(None),
     });
 
-    rebuild_effects_group(&state);
-    content.append(&build_vst_group(&state));
+    rebuild_groups(&state);
 
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -79,15 +86,26 @@ pub fn open(parent: &impl IsA<gtk::Widget>, deps: EffectsDeps, channel_id: u64) 
     toolbar.set_content(Some(&scroller));
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(parent));
+
+    let refresh: Rc<dyn Fn()> = {
+        let state = state.clone();
+        Rc::new(move || rebuild_groups(&state))
+    };
+    (dialog, refresh)
+}
+
+/// (Re)build both groups from config + runtime state.
+fn rebuild_groups(state: &Rc<DialogState>) {
+    while let Some(child) = state.effects_box.first_child() {
+        state.effects_box.remove(&child);
+    }
+    state.effects_box.append(&build_vst_group(state));
+    state.effects_box.append(&build_lv2_group(state));
 }
 
 // ---- LV2 chain -------------------------------------------------------------
 
-fn rebuild_effects_group(state: &Rc<DialogState>) {
-    while let Some(child) = state.effects_box.first_child() {
-        state.effects_box.remove(&child);
-    }
-
+fn build_lv2_group(state: &Rc<DialogState>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Effect Chain (LV2)")
         .description("Applied to this input before it reaches the monitor and stream mixes, top to bottom.")
@@ -222,7 +240,7 @@ fn rebuild_effects_group(state: &Rc<DialogState>) {
         ));
     }
 
-    state.effects_box.append(&group);
+    group
 }
 
 /// One parameter row: a switch for toggle ports, otherwise a slider.
@@ -324,7 +342,7 @@ fn structural_change(
     (state.deps.on_structure)(state.channel_id);
     // Deferred: the change may originate from a widget this rebuild removes.
     let state = state.clone();
-    glib::idle_add_local_once(move || rebuild_effects_group(&state));
+    glib::idle_add_local_once(move || rebuild_groups(&state));
 }
 
 // ---- Plugin picker -----------------------------------------------------------
@@ -409,73 +427,333 @@ fn open_plugin_picker(state: &Rc<DialogState>) {
     picker.present(Some(&state.dialog));
 }
 
-// ---- Carla / VST rack ---------------------------------------------------------
+// ---- VST rack ----------------------------------------------------------------
 
 fn build_vst_group(state: &Rc<DialogState>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title("VST Rack (Carla)")
+        .title("VST Rack")
+        .description(
+            "VST2/VST3 plugins from your plugin folders, processed before \
+             the LV2 chain.",
+        )
         .build();
-    let available = state.deps.manager.carla_available();
+    let available = vst::available();
 
-    let enable = adw::SwitchRow::builder()
-        .title("Enable VST Rack")
-        .subtitle("Route this input through a Carla rack hosting VST2/VST3 plugins, in front of the LV2 chain")
-        .sensitive(available)
-        .build();
-    let open_row = adw::ActionRow::builder()
-        .title("Plugin Rack")
-        .subtitle("Add and edit VST plugins in the Carla window. Save there (Ctrl+S) so the rack is restored next time.")
-        .build();
-    let open_btn = gtk::Button::builder()
-        .label("Open")
-        .valign(gtk::Align::Center)
-        .build();
-    open_row.add_suffix(&open_btn);
-
-    if !available {
-        group.set_description(Some(
-            "Carla is not installed. Install the “Carla” package to host \
-             VST plugins on this channel.",
-        ));
-    }
-
-    let rack_on = state
+    let plugins = state
         .deps
         .config
         .borrow()
         .channel(state.channel_id)
-        .map(|c| c.vst_rack)
-        .unwrap_or(false);
-    enable.set_active(rack_on && available);
-    open_row.set_sensitive(available && rack_on);
+        .map(|c| c.vst_plugins.clone())
+        .unwrap_or_default();
+    let runtime = state.deps.manager.vst_runtime(state.channel_id);
+    let count = plugins.len();
 
-    {
-        let state = state.clone();
-        let open_row = open_row.clone();
-        enable.connect_active_notify(move |sw| {
-            let on = sw.is_active();
-            {
-                let mut cfg = state.deps.config.borrow_mut();
-                let Some(ch) = cfg.channel_mut(state.channel_id) else {
-                    return;
-                };
-                if ch.vst_rack == on {
-                    return;
+    for (pos, plugin) in plugins.iter().enumerate() {
+        let row = adw::ExpanderRow::builder()
+            .title(glib::markup_escape_text(&plugin.name))
+            .build();
+
+        let enable = gtk::Switch::builder()
+            .active(plugin.enabled)
+            .valign(gtk::Align::Center)
+            .tooltip_text("Enable this plugin")
+            .build();
+        {
+            let state = state.clone();
+            let vst_id = plugin.id;
+            enable.connect_state_set(move |_, on| {
+                structural_change(&state, |ch| {
+                    if let Some(p) = ch.vst_mut(vst_id) {
+                        p.enabled = on;
+                    }
+                });
+                glib::Propagation::Proceed
+            });
+        }
+        row.add_prefix(&enable);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        buttons.set_valign(gtk::Align::Center);
+        for (icon, tip, delta) in [
+            ("go-up-symbolic", "Move up", -1i32),
+            ("go-down-symbolic", "Move down", 1),
+        ] {
+            let btn = gtk::Button::builder()
+                .icon_name(icon)
+                .tooltip_text(tip)
+                .valign(gtk::Align::Center)
+                .sensitive(if delta < 0 { pos > 0 } else { pos + 1 < count })
+                .build();
+            btn.add_css_class("flat");
+            let state = state.clone();
+            let vst_id = plugin.id;
+            btn.connect_clicked(move |_| {
+                structural_change(&state, |ch| {
+                    if let Some(i) = ch.vst_plugins.iter().position(|p| p.id == vst_id) {
+                        let j = i as i32 + delta;
+                        if j >= 0 && (j as usize) < ch.vst_plugins.len() {
+                            ch.vst_plugins.swap(i, j as usize);
+                        }
+                    }
+                });
+            });
+            buttons.append(&btn);
+        }
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove this plugin")
+            .valign(gtk::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        {
+            let state = state.clone();
+            let vst_id = plugin.id;
+            remove.connect_clicked(move |_| {
+                structural_change(&state, |ch| {
+                    ch.vst_plugins.retain(|p| p.id != vst_id);
+                });
+            });
+        }
+        buttons.append(&remove);
+        row.add_suffix(&buttons);
+
+        if !plugin.enabled {
+            row.set_subtitle("Bypassed");
+            row.set_enable_expansion(false);
+        } else {
+            match runtime.iter().find(|r| r.cfg_id == plugin.id) {
+                Some(rt) => match &rt.state {
+                    VstState::Loaded => {
+                        if rt.params.is_empty() {
+                            row.set_subtitle("No editable parameters");
+                            row.set_enable_expansion(false);
+                        }
+                        for param in &rt.params {
+                            let value = plugin
+                                .params
+                                .get(&param.index.to_string())
+                                .copied()
+                                .unwrap_or(param.value);
+                            row.add_row(&vst_param_row(state, plugin.id, param, value));
+                        }
+                    }
+                    VstState::Loading => {
+                        row.set_subtitle("Loading…");
+                        row.set_enable_expansion(false);
+                    }
+                    VstState::Failed(e) => {
+                        row.set_subtitle(&glib::markup_escape_text(e));
+                        row.set_enable_expansion(false);
+                    }
+                },
+                None => {
+                    row.set_subtitle("Starting rack…");
+                    row.set_enable_expansion(false);
                 }
-                ch.vst_rack = on;
             }
-            open_row.set_sensitive(on);
-            (state.deps.on_structure)(state.channel_id);
-        });
+        }
+        group.add(&row);
     }
-    {
+
+    if available {
+        let add_row = adw::ButtonRow::builder()
+            .title("Add VST Plugin…")
+            .start_icon_name("list-add-symbolic")
+            .build();
+        let state_c = state.clone();
+        add_row.connect_activated(move |_| open_vst_picker(&state_c));
+        group.add(&add_row);
+    } else {
+        group.set_description(Some(
+            "VST hosting requires Carla's engine and Python. Install the \
+             “Carla” package to add VST plugins here.",
+        ));
+    }
+
+    group
+}
+
+/// One VST parameter row: a switch for toggle parameters, otherwise a slider.
+fn vst_param_row(
+    state: &Rc<DialogState>,
+    vst_id: u64,
+    param: &VstParamInfo,
+    value: f64,
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&param.name))
+        .build();
+    let index = param.index;
+    if param.toggled {
+        let sw = gtk::Switch::builder()
+            .active(value > 0.5)
+            .valign(gtk::Align::Center)
+            .build();
         let state = state.clone();
-        open_btn.connect_clicked(move |_| {
-            state.deps.manager.open_carla(state.channel_id);
+        sw.connect_state_set(move |_, on| {
+            vst_param_change(&state, vst_id, index, if on { 1.0 } else { 0.0 });
+            glib::Propagation::Proceed
+        });
+        row.add_suffix(&sw);
+        row.set_activatable_widget(Some(&sw));
+    } else {
+        let min = param.min;
+        let max = if param.max > param.min {
+            param.max
+        } else {
+            param.min + 1.0
+        };
+        let step = if param.integer { 1.0 } else { (max - min) / 200.0 };
+        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
+        scale.set_value(value.clamp(min, max));
+        scale.set_width_request(200);
+        scale.set_draw_value(true);
+        scale.set_value_pos(gtk::PositionType::Right);
+        scale.set_digits(if param.integer { 0 } else { 2 });
+        scale.set_valign(gtk::Align::Center);
+        let state = state.clone();
+        scale.connect_value_changed(move |s| {
+            vst_param_change(&state, vst_id, index, s.value());
+        });
+        row.add_suffix(&scale);
+    }
+    row
+}
+
+/// Persist a VST parameter and (debounced) push it into the running rack.
+fn vst_param_change(state: &Rc<DialogState>, vst_id: u64, index: u32, value: f64) {
+    {
+        let mut cfg = state.deps.config.borrow_mut();
+        if let Some(ch) = cfg.channel_mut(state.channel_id) {
+            if let Some(p) = ch.vst_mut(vst_id) {
+                p.params.insert(index.to_string(), value);
+            }
+        }
+    }
+    (state.deps.on_control)(state.channel_id);
+
+    if let Some(old) = state.control_debounce.borrow_mut().take() {
+        old.remove();
+    }
+    let state_c = state.clone();
+    let source = glib::timeout_add_local_once(Duration::from_millis(80), move || {
+        *state_c.control_debounce.borrow_mut() = None;
+        state_c
+            .deps
+            .manager
+            .set_vst_param(state_c.channel_id, vst_id, index, value);
+    });
+    *state.control_debounce.borrow_mut() = Some(source);
+}
+
+fn open_vst_picker(state: &Rc<DialogState>) {
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search VST plugins…")
+        .hexpand(true)
+        .build();
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+
+    let picker = adw::Dialog::builder()
+        .title("Add VST Plugin")
+        .content_width(480)
+        .content_height(600)
+        .build();
+
+    // Discovery probes every new binary in a helper process; the first run
+    // can take a while, so scan off the main loop with a placeholder row.
+    let scanning = adw::ActionRow::builder()
+        .title("Scanning plugin folders…")
+        .subtitle("First scan probes every plugin binary; later scans are cached.")
+        .build();
+    let spinner = adw::Spinner::new();
+    spinner.set_valign(gtk::Align::Center);
+    scanning.add_prefix(&spinner);
+    list.append(&scanning);
+
+    let handle = gio::spawn_blocking(vst::scan);
+    {
+        let list = list.clone();
+        let picker = picker.clone();
+        let state = state.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let entries = handle.await.unwrap_or_default();
+            list.remove(&scanning);
+            if entries.is_empty() {
+                let row = adw::ActionRow::builder()
+                    .title("No VST plugins found")
+                    .subtitle(
+                        "Searched ~/vst, ~/.vst, ~/.vst3, the system vst/vst3 \
+                         folders, and $VST_PATH/$VST3_PATH.",
+                    )
+                    .build();
+                list.append(&row);
+            }
+            for entry in &entries {
+                let subtitle = format!(
+                    "{} — {}",
+                    entry.format.as_str().to_uppercase(),
+                    entry.path
+                );
+                let row = adw::ActionRow::builder()
+                    .title(glib::markup_escape_text(&entry.name))
+                    .subtitle(glib::markup_escape_text(&subtitle))
+                    .activatable(true)
+                    .build();
+                row.add_suffix(&gtk::Image::from_icon_name("list-add-symbolic"));
+                let state = state.clone();
+                let picker = picker.clone();
+                let entry = entry.clone();
+                row.connect_activated(move |_| {
+                    structural_change(&state, |ch| {
+                        ch.add_vst(&entry);
+                    });
+                    picker.close();
+                });
+                list.append(&row);
+            }
         });
     }
 
-    group.add(&enable);
-    group.add(&open_row);
-    group
+    {
+        let search = search.clone();
+        list.set_filter_func(move |row| {
+            let text = search.text().to_lowercase();
+            if text.is_empty() {
+                return true;
+            }
+            let Some(row) = row.downcast_ref::<adw::ActionRow>() else {
+                return true;
+            };
+            row.title().to_lowercase().contains(&text)
+                || row.subtitle().is_some_and(|s| s.to_lowercase().contains(&text))
+        });
+    }
+    {
+        let list = list.clone();
+        search.connect_search_changed(move |_| list.invalidate_filter());
+    }
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.append(&search);
+    content.append(&list);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&content)
+        .vexpand(true)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+    picker.set_child(Some(&toolbar));
+    picker.present(Some(&state.dialog));
 }

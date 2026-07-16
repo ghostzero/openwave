@@ -3,6 +3,7 @@ mod config;
 mod fx;
 mod lv2;
 mod ui;
+mod vst;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -30,6 +31,14 @@ fn main() -> glib::ExitCode {
         "List usable LV2 plugins and exit (diagnostic)",
         None,
     );
+    app.add_main_option(
+        "list-vst",
+        glib::Char::from(0u8),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "List usable VST plugins and exit (diagnostic)",
+        None,
+    );
     let start_hidden = Rc::new(Cell::new(false));
     {
         let start_hidden = start_hidden.clone();
@@ -50,13 +59,43 @@ fn main() -> glib::ExitCode {
                     }
                 }
             }
+            if options.contains("list-vst") {
+                if !vst::available() {
+                    eprintln!("VST hosting unavailable (Carla and/or python3 missing)");
+                    return std::ops::ControlFlow::Break(glib::ExitCode::FAILURE);
+                }
+                let entries = vst::scan();
+                for e in &entries {
+                    println!(
+                        "{} [{}] {}{}",
+                        e.name,
+                        e.format.as_str(),
+                        e.path,
+                        if e.label.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", e.label)
+                        }
+                    );
+                }
+                eprintln!("{} usable plugins", entries.len());
+                return std::ops::ControlFlow::Break(glib::ExitCode::SUCCESS);
+            }
             if options.contains("hidden") {
                 start_hidden.set(true);
             }
             std::ops::ControlFlow::Continue(()) // continue normal processing
         });
     }
-    app.connect_startup(|_| ui::load_css());
+    app.connect_startup(|_| {
+        ui::load_css();
+        // Warm the VST discovery cache so the plugin picker opens fast.
+        if vst::available() {
+            std::thread::spawn(|| {
+                let _ = vst::scan();
+            });
+        }
+    });
     app.connect_activate(move |app| {
         // Closing only hides the window; re-activation brings it back.
         if let Some(window) = app

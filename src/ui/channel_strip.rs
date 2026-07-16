@@ -164,20 +164,20 @@ impl ChannelStrip {
 
     /// Tint the FX button while the channel processes through effects.
     pub fn update_fx_indicator(&self, c: &ChannelConfig) {
-        let enabled = c.effects.iter().filter(|e| e.enabled).count();
-        let active = c.fx_active();
-        if active {
+        let lv2 = c.effects.iter().filter(|e| e.enabled).count();
+        let vst = c.vst_plugins.iter().filter(|p| p.enabled).count();
+        if c.fx_active() {
             self.fx.add_css_class("accent");
         } else {
             self.fx.remove_css_class("accent");
         }
         let mut tip = String::from("Effects");
         let mut parts = Vec::new();
-        if enabled > 0 {
-            parts.push(format!("{enabled} LV2"));
+        if vst > 0 {
+            parts.push(format!("{vst} VST"));
         }
-        if c.vst_rack {
-            parts.push("VST rack".to_string());
+        if lv2 > 0 {
+            parts.push(format!("{lv2} LV2"));
         }
         if !parts.is_empty() {
             tip = format!("Effects ({} active)", parts.join(" + "));

@@ -9,17 +9,23 @@
 //!   regular loopback plumbing in `audio.rs` routes through. Control-port
 //!   changes are applied live with `pw-cli set-param <node> Props …`.
 //!
-//! * The optional Carla rack (`carla-rack`), a VST2/VST3 host. It shows up
-//!   as a JACK client named `OpenWave_Ch<id>_VST` (via PIPEWIRE_PROPS); it
-//!   is wired in front of the chain sink with `pw-link` against a dedicated
-//!   null sink's monitor, because JACK clients are invisible to the
-//!   PulseAudio API.
+//! * The VST rack: a headless helper (`data/vsthost.py`, embedded and run
+//!   with python3) hosting VST2/VST3 plugins through Carla's engine
+//!   library — no Carla UI anywhere; OpenWave's own dialog edits the
+//!   parameters over a JSON-lines pipe. The helper registers as a JACK
+//!   client named `OpenWave_Ch<id>_VST` and is wired in front of the chain
+//!   sink with `pw-link` against a dedicated null sink's monitor, because
+//!   JACK clients are invisible to the PulseAudio API. Structural changes
+//!   (add/remove/reorder/enable) respawn the helper with the new plugin
+//!   set; parameter changes are sent live.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+use std::os::fd::IntoRawFd;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -27,6 +33,8 @@ use gtk::{gio, glib};
 
 use crate::config::ChannelConfig;
 use crate::lv2::Catalog;
+
+const VSTHOST_SCRIPT: &str = include_str!("../data/vsthost.py");
 
 pub fn chain_sink_name(id: u64) -> String {
     format!("OpenWave_Ch{id}_FX")
@@ -40,7 +48,7 @@ pub fn vstin_sink_name(id: u64) -> String {
     format!("OpenWave_Ch{id}_VSTIn")
 }
 
-pub fn carla_node_name(id: u64) -> String {
+pub fn vst_node_name(id: u64) -> String {
     format!("OpenWave_Ch{id}_VST")
 }
 
@@ -54,13 +62,44 @@ pub fn effect_labels(effect_id: u64, mono: bool) -> Vec<String> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum FxEvent {
     /// The chain process for a channel exited without being asked to.
     ChainDied(u64),
-    /// The Carla rack for a channel exited (user closed the window, crash)
-    /// or never became linkable.
-    CarlaDied(u64),
+    /// The VST host helper for a channel exited (crash) or never became
+    /// linkable.
+    VstHostDied(u64),
+    /// A protocol line arrived from a channel's VST host helper; route it
+    /// back into `FxManager::handle_vst_reply`.
+    VstReply(u64, String),
+}
+
+/// One parameter of a loaded VST plugin, as reported by the helper.
+#[derive(Clone, Debug)]
+pub struct VstParamInfo {
+    pub index: u32,
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub value: f64,
+    pub toggled: bool,
+    pub integer: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum VstState {
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+/// Runtime info for one configured VST plugin (UI reads this to render
+/// parameter rows).
+#[derive(Clone, Debug)]
+pub struct VstRuntime {
+    pub cfg_id: u64,
+    pub state: VstState,
+    pub params: Vec<VstParamInfo>,
 }
 
 struct Slot {
@@ -96,36 +135,42 @@ struct ChainSlot {
     fails: u32,
 }
 
-struct CarlaSlot {
+struct VstSlot {
     slot: Slot,
-    gui: bool,
+    stdin: Option<ChildStdin>,
+    /// Signature of the enabled plugin set the helper was started with;
+    /// a different set means respawn.
+    desc: String,
+    runtime: Vec<VstRuntime>,
+    /// Consecutive quick deaths with this plugin set; at 2 we stop
+    /// respawning so a crashing plugin can't cause a loop.
+    fails: u32,
     /// Cancellation flag for the link-poll timeout. The poll source removes
     /// itself (returns Break) when this is set — never remove a stored
     /// SourceId here, a source that already broke would panic on remove.
     link_cancel: Option<Rc<Cell<bool>>>,
+    /// Same pattern for the stdout-reader poll.
+    reader_cancel: Rc<Cell<bool>>,
 }
 
-impl Drop for CarlaSlot {
+impl Drop for VstSlot {
     fn drop(&mut self) {
         if let Some(c) = self.link_cancel.take() {
             c.set(true);
         }
+        self.reader_cancel.set(true);
     }
 }
 
 #[derive(Default)]
 pub struct FxManager {
     chains: HashMap<u64, ChainSlot>,
-    carlas: HashMap<u64, CarlaSlot>,
+    vsts: HashMap<u64, VstSlot>,
     handler: Option<Rc<dyn Fn(FxEvent)>>,
 }
 
 fn fx_dir() -> PathBuf {
     glib::user_config_dir().join("openwave").join("fx")
-}
-
-fn carla_dir() -> PathBuf {
-    glib::user_config_dir().join("openwave").join("carla")
 }
 
 fn sanitize_token(s: &str) -> String {
@@ -195,7 +240,7 @@ impl FxManager {
                 failed.set(true);
             }
             if let Some(h) = &handler {
-                h(event);
+                h(event.clone());
             }
         });
     }
@@ -283,110 +328,204 @@ impl FxManager {
         let _ = glib::spawn_command_line_async(cmd);
     }
 
-    // ---- Carla rack --------------------------------------------------------
+    // ---- VST rack (headless helper) -----------------------------------------
 
-    pub fn carla_available() -> bool {
-        glib::find_program_in_path("carla-rack").is_some()
+    pub fn vst_running(&self, id: u64) -> bool {
+        self.vsts.get(&id).is_some_and(|c| c.slot.running())
     }
 
-    pub fn carla_running(&self, id: u64) -> bool {
-        self.carlas.get(&id).is_some_and(|c| c.slot.running())
+    /// Runtime plugin/parameter info for the UI.
+    pub fn vst_runtime(&self, id: u64) -> Vec<VstRuntime> {
+        self.vsts
+            .get(&id)
+            .map(|s| s.runtime.clone())
+            .unwrap_or_default()
     }
 
-    fn carla_project(id: u64) -> Option<PathBuf> {
-        let dir = carla_dir();
-        fs::create_dir_all(&dir).ok()?;
-        let path = dir.join(format!("ch{id}.carxp"));
-        if !path.exists() {
-            fs::write(
-                &path,
-                "<?xml version='1.0' encoding='UTF-8'?>\n\
-                 <!DOCTYPE CARLA-PROJECT>\n\
-                 <CARLA-PROJECT VERSION='2.5'>\n\
-                 </CARLA-PROJECT>\n",
-            )
-            .ok()?;
+    pub fn kill_vst(&mut self, id: u64) {
+        if let Some(c) = self.vsts.remove(&id) {
+            c.slot.kill();
         }
-        Some(path)
     }
 
-    fn spawn_carla(&mut self, id: u64, gui: bool) -> bool {
-        let Some(bin) = glib::find_program_in_path("carla-rack") else {
+    /// Make sure a helper hosting exactly the channel's enabled VST plugins
+    /// runs (respawning when the set changed); returns whether one runs.
+    pub fn ensure_vst_host(&mut self, id: u64, cfg: &ChannelConfig) -> bool {
+        let enabled = cfg.enabled_vsts();
+        if enabled.is_empty() {
+            self.kill_vst(id);
+            return false;
+        }
+        let desc: String = enabled
+            .iter()
+            .map(|p| format!("{}\x1f{}\x1f{}\x1f{}", p.id, p.path, p.label, p.format.as_str()))
+            .collect::<Vec<_>>()
+            .join("\x1e");
+        let mut fails = 0;
+        if let Some(s) = self.vsts.get(&id) {
+            if s.desc == desc {
+                if s.slot.running() {
+                    return true;
+                }
+                if s.slot.failed.get() {
+                    fails = s.fails + 1;
+                    if fails >= 2 {
+                        return false; // known-bad set; wire without the rack
+                    }
+                }
+            }
+        }
+        self.kill_vst(id);
+
+        let dir = fx_dir();
+        let _ = fs::create_dir_all(&dir);
+        let script = dir.join("vsthost.py");
+        if fs::write(&script, VSTHOST_SCRIPT).is_err() {
+            return false;
+        }
+        let Some(python) = glib::find_program_in_path("python3") else {
             return false;
         };
-        let Some(project) = Self::carla_project(id) else {
-            return false;
-        };
-        let mut argv = vec![bin.display().to_string()];
-        if !gui {
-            argv.push("--no-gui".to_string());
-        }
-        argv.push(project.display().to_string());
-        let envs = [(
-            "PIPEWIRE_PROPS".to_string(),
-            format!("{{ node.name = \"{}\" }}", carla_node_name(id)),
-        )];
         let slot = Slot {
             pid: 0,
             alive: Rc::new(Cell::new(true)),
             expect_exit: Rc::new(Cell::new(false)),
             failed: Rc::new(Cell::new(false)),
         };
-        let Some(pid) = spawn_child(&argv, &envs, &format!("openwave-carla-ch{id}.log"))
-        else {
+        let Some((pid, mut stdin, stdout_fd)) = spawn_child_piped(
+            &[
+                python.display().to_string(),
+                script.display().to_string(),
+                vst_node_name(id),
+            ],
+            &format!("openwave-vst-ch{id}.log"),
+        ) else {
             return false;
         };
         let slot = Slot { pid, ..slot };
-        self.watch(pid, &slot, FxEvent::CarlaDied(id), false);
-        self.carlas.insert(
+        self.watch(pid, &slot, FxEvent::VstHostDied(id), true);
+
+        // Forward every protocol line back through the event handler (which
+        // re-enters handle_vst_reply outside of any Inner borrow).
+        let reader_cancel = Rc::new(Cell::new(false));
+        if let Some(handler) = self.handler.clone() {
+            watch_lines(stdout_fd, reader_cancel.clone(), move |line| {
+                handler(FxEvent::VstReply(id, line))
+            });
+        }
+
+        let plugins: Vec<serde_json::Value> = enabled
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "cfg_id": p.id,
+                    "path": p.path,
+                    "format": p.format.as_str(),
+                    "label": p.label,
+                    "active": true,
+                    "params": p.params,
+                })
+            })
+            .collect();
+        let msg = serde_json::json!({ "cmd": "load", "plugins": plugins });
+        let _ = writeln!(stdin, "{msg}");
+        let runtime = enabled
+            .iter()
+            .map(|p| VstRuntime {
+                cfg_id: p.id,
+                state: VstState::Loading,
+                params: Vec::new(),
+            })
+            .collect();
+        self.vsts.insert(
             id,
-            CarlaSlot {
+            VstSlot {
                 slot,
-                gui,
+                stdin: Some(stdin),
+                desc,
+                runtime,
+                fails,
                 link_cancel: None,
+                reader_cancel,
             },
         );
         true
     }
 
-    /// Ensure a (headless) rack process exists; returns whether one runs.
-    pub fn ensure_carla(&mut self, id: u64) -> bool {
-        if self.carla_running(id) {
-            return true;
+    /// Push a parameter value into the running rack.
+    pub fn set_vst_param(&mut self, id: u64, cfg_id: u64, index: u32, value: f64) {
+        let Some(slot) = self.vsts.get_mut(&id) else {
+            return;
+        };
+        if let Some(stdin) = slot.stdin.as_mut() {
+            let msg = serde_json::json!({
+                "cmd": "set", "cfg_id": cfg_id, "param": index, "value": value,
+            });
+            let _ = writeln!(stdin, "{msg}");
         }
-        self.carlas.remove(&id).map(|c| c.slot.kill());
-        self.spawn_carla(id, false)
-    }
-
-    /// Bring up the rack with its editor window. A headless instance is
-    /// restarted with the GUI (it reloads the saved project). Returns true
-    /// when the rack was already running before the call.
-    pub fn open_carla_gui(&mut self, id: u64) -> bool {
-        if let Some(c) = self.carlas.get(&id) {
-            if c.slot.running() && c.gui {
-                return true;
+        // Mirror into the runtime cache so a dialog rebuild shows the value.
+        if let Some(rt) = slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id) {
+            if let Some(p) = rt.params.iter_mut().find(|p| p.index == index) {
+                p.value = value;
             }
         }
-        let was_running = self.carla_running(id);
-        if let Some(c) = self.carlas.remove(&id) {
-            c.slot.kill();
-        }
-        self.spawn_carla(id, true);
-        was_running
     }
 
-    pub fn kill_carla(&mut self, id: u64) {
-        if let Some(c) = self.carlas.remove(&id) {
-            c.slot.kill();
+    /// Process a protocol line from a helper. Returns true when the runtime
+    /// info changed (the UI should refresh).
+    pub fn handle_vst_reply(&mut self, id: u64, line: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        if v["reply"].as_str() != Some("loaded") {
+            return false;
         }
+        let Some(slot) = self.vsts.get_mut(&id) else {
+            return false;
+        };
+        for item in v["plugins"].as_array().into_iter().flatten() {
+            let Some(cfg_id) = item["cfg_id"].as_u64() else {
+                continue;
+            };
+            let Some(rt) = slot.runtime.iter_mut().find(|r| r.cfg_id == cfg_id) else {
+                continue;
+            };
+            if item["ok"].as_bool() == Some(true) {
+                rt.state = VstState::Loaded;
+                rt.params = item["params"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| {
+                        Some(VstParamInfo {
+                            index: p["index"].as_u64()? as u32,
+                            name: p["name"].as_str().unwrap_or("Parameter").to_string(),
+                            min: p["min"].as_f64().unwrap_or(0.0),
+                            max: p["max"].as_f64().unwrap_or(1.0),
+                            value: p["value"].as_f64().unwrap_or(0.0),
+                            toggled: p["toggled"].as_bool().unwrap_or(false),
+                            integer: p["integer"].as_bool().unwrap_or(false),
+                        })
+                    })
+                    .collect();
+            } else {
+                rt.state = VstState::Failed(
+                    item["error"]
+                        .as_str()
+                        .unwrap_or("could not load plugin")
+                        .to_string(),
+                );
+            }
+        }
+        true
     }
 
-    /// Keep trying to wire VSTIn.monitor → Carla → chain sink until the
-    /// Carla node's ports exist. `pw-link` exits with "File exists" once a
+    /// Keep trying to wire VSTIn.monitor → VST host → chain sink until the
+    /// helper's JACK ports exist. `pw-link` exits with "File exists" once a
     /// link is up, which counts as success; "No such object" means the node
     /// is not there yet.
-    pub fn start_carla_links(&mut self, id: u64) {
-        let Some(c) = self.carlas.get_mut(&id) else {
+    pub fn start_vst_links(&mut self, id: u64) {
+        let Some(c) = self.vsts.get_mut(&id) else {
             return;
         };
         if let Some(old) = c.link_cancel.take() {
@@ -395,13 +534,13 @@ impl FxManager {
         let cancel = Rc::new(Cell::new(false));
         c.link_cancel = Some(cancel.clone());
         let vstin = vstin_sink_name(id);
-        let carla = carla_node_name(id);
+        let vst = vst_node_name(id);
         let sink = chain_sink_name(id);
         let script = format!(
-            "pw-link '{vstin}:monitor_FL' '{carla}:audio-in1' 2>&1; \
-             pw-link '{vstin}:monitor_FR' '{carla}:audio-in2' 2>&1; \
-             pw-link '{carla}:audio-out1' '{sink}:playback_FL' 2>&1; \
-             pw-link '{carla}:audio-out2' '{sink}:playback_FR' 2>&1; \
+            "pw-link '{vstin}:monitor_FL' '{vst}:audio-in1' 2>&1; \
+             pw-link '{vstin}:monitor_FR' '{vst}:audio-in2' 2>&1; \
+             pw-link '{vst}:audio-out1' '{sink}:playback_FL' 2>&1; \
+             pw-link '{vst}:audio-out2' '{sink}:playback_FR' 2>&1; \
              exit 0"
         );
         let alive = c.slot.alive.clone();
@@ -417,7 +556,7 @@ impl FxManager {
                 // The node never became linkable; give up so the channel
                 // can be rewired without the rack.
                 if let Some(h) = &handler {
-                    h(FxEvent::CarlaDied(id));
+                    h(FxEvent::VstHostDied(id));
                 }
                 return glib::ControlFlow::Break;
             }
@@ -447,7 +586,7 @@ impl FxManager {
 
     pub fn remove_channel(&mut self, id: u64) {
         self.ensure_chain(id, None);
-        self.kill_carla(id);
+        self.kill_vst(id);
         let _ = fs::remove_file(fx_dir().join(format!("ch{id}.conf")));
     }
 
@@ -455,10 +594,91 @@ impl FxManager {
         for (_, c) in self.chains.drain() {
             c.slot.kill();
         }
-        for (_, c) in self.carlas.drain() {
+        for (_, c) in self.vsts.drain() {
             c.slot.kill();
         }
     }
+}
+
+/// Like `spawn_child` but with piped stdin/stdout for the JSON protocol
+/// (stderr still goes to the log file).
+fn spawn_child_piped(argv: &[String], log: &str) -> Option<(i32, ChildStdin, i32)> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    match fs::File::create(glib::user_runtime_dir().join(log)) {
+        Ok(f) => {
+            cmd.stderr(Stdio::from(f));
+        }
+        Err(_) => {
+            cmd.stderr(Stdio::null());
+        }
+    }
+    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    Some((child.id() as i32, stdin, stdout.into_raw_fd()))
+}
+
+/// Deliver every line arriving on `fd` to `on_line`, polled from a main-loop
+/// timer (this glib version exposes no fd-watch API). Owns the fd; closes it
+/// and removes itself at EOF or when `cancel` is set.
+fn watch_lines(fd: i32, cancel: Rc<Cell<bool>>, on_line: impl Fn(String) + 'static) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let buf = std::cell::RefCell::new(Vec::<u8>::new());
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        if cancel.get() {
+            unsafe {
+                libc::close(fd);
+            }
+            return glib::ControlFlow::Break;
+        }
+        let mut tmp = [0u8; 4096];
+        let eof = loop {
+            let n =
+                unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+            if n > 0 {
+                buf.borrow_mut().extend_from_slice(&tmp[..n as usize]);
+            } else {
+                break n == 0;
+            }
+        };
+        loop {
+            let line = {
+                let mut b = buf.borrow_mut();
+                let Some(pos) = b.iter().position(|&c| c == b'\n') else {
+                    break;
+                };
+                let raw: Vec<u8> = b.drain(..=pos).collect();
+                String::from_utf8(raw).ok()
+            };
+            if let Some(line) = line {
+                let line = line.trim().to_string();
+                if !line.is_empty() {
+                    on_line(line);
+                }
+            }
+        }
+        if eof {
+            unsafe {
+                libc::close(fd);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Build the `pipewire -c` configuration hosting this channel's filter
