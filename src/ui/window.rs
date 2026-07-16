@@ -30,9 +30,9 @@ struct App {
     save_pending: Cell<bool>,
     /// Per-channel edit counter used to debounce rename → sink rebuild.
     rename_epoch: RefCell<HashMap<u64, u64>>,
-    /// The open effects dialog (channel id + refresh hook), so VST rack
-    /// load results can update it live.
-    fx_dialog: RefCell<Option<(u64, Rc<dyn Fn()>)>>,
+    /// The open effects dialog (channel id + hooks), so VST rack load
+    /// results and native-UI parameter edits can update it live.
+    fx_dialog: RefCell<Option<(u64, Rc<effects::DialogHooks>)>>,
     /// Forces every strip and the add-channel card to the same width.
     strip_size_group: gtk::SizeGroup,
 }
@@ -253,17 +253,28 @@ fn wire_audio_events(app: &Rc<App>) {
                 LevelTarget::StreamMix => app.outputs.stream_level.set_value(v),
             },
             AudioEvent::VstChanged(id) => {
-                let refresh = app
+                let hooks = app
                     .fx_dialog
                     .borrow()
                     .as_ref()
                     .filter(|(did, _)| *did == id)
-                    .map(|(_, r)| r.clone());
-                if let Some(refresh) = refresh {
-                    refresh();
+                    .map(|(_, h)| h.clone());
+                if let Some(hooks) = hooks {
+                    (hooks.refresh)();
                 }
             }
-            AudioEvent::VstParams(_) => schedule_save(&app),
+            AudioEvent::VstParams(id, updates) => {
+                schedule_save(&app);
+                let hooks = app
+                    .fx_dialog
+                    .borrow()
+                    .as_ref()
+                    .filter(|(did, _)| *did == id)
+                    .map(|(_, h)| h.clone());
+                if let Some(hooks) = hooks {
+                    (hooks.sync_params)(&updates);
+                }
+            }
         }
     });
 }
@@ -591,7 +602,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                 let app = app.clone();
                 Rc::new(move |_id: u64| schedule_save(&app))
             };
-            let (dialog, refresh) = effects::open(
+            let (dialog, hooks) = effects::open(
                 btn,
                 EffectsDeps {
                     config: app.config.clone(),
@@ -601,7 +612,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
                 },
                 id,
             );
-            *app.fx_dialog.borrow_mut() = Some((id, refresh));
+            *app.fx_dialog.borrow_mut() = Some((id, Rc::new(hooks)));
             let app = app.clone();
             dialog.connect_closed(move |_| {
                 let mut open = app.fx_dialog.borrow_mut();

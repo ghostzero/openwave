@@ -88,8 +88,9 @@ pub enum AudioEvent {
     /// A channel's VST rack finished (re)loading; parameter info changed.
     VstChanged(u64),
     /// VST parameters were edited from a plugin's own window and written
-    /// into the config; it should be persisted.
-    VstParams(u64),
+    /// into the config: (channel, [(plugin cfg_id, param index, value)]).
+    /// The config should be persisted and open dialog sliders updated.
+    VstParams(u64, Vec<(u64, u32, f64)>),
 }
 
 #[derive(Clone, Debug)]
@@ -226,7 +227,7 @@ impl PulseManager {
                         }
                         drop(cfg);
                         drop(inner);
-                        Self::emit(&rc, AudioEvent::VstParams(id));
+                        Self::emit(&rc, AudioEvent::VstParams(id, outcome.params));
                     }
                     if outcome.structure_changed {
                         Self::emit(&rc, AudioEvent::VstChanged(id));

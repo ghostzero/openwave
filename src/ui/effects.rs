@@ -1,7 +1,8 @@
 //! Per-channel effects dialog: an ordered LV2 plugin chain with inline
 //! parameter editing, plus the optional Carla VST rack.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -25,6 +26,11 @@ pub struct EffectsDeps {
     pub on_control: Rc<dyn Fn(u64)>,
 }
 
+enum VstParamWidget {
+    Scale(gtk::Scale),
+    Switch(gtk::Switch),
+}
+
 struct DialogState {
     channel_id: u64,
     deps: EffectsDeps,
@@ -34,15 +40,29 @@ struct DialogState {
     /// Trailing-edge debouncer for pw-cli control updates while a slider
     /// is being dragged.
     control_debounce: RefCell<Option<glib::SourceId>>,
+    /// VST parameter widgets by (plugin cfg_id, param index), so edits made
+    /// in a plugin's native window can move the sliders here live.
+    vst_widgets: RefCell<HashMap<(u64, u32), VstParamWidget>>,
+    /// Set while widgets are updated programmatically; their change
+    /// handlers must not write back (the value came from the engine).
+    syncing: Cell<bool>,
 }
 
-/// Present the dialog; returns it together with a refresh closure the
-/// window calls when a rack finishes loading (AudioEvent::VstChanged).
+/// Hooks the window keeps for the open dialog.
+pub struct DialogHooks {
+    /// Rebuild everything (a rack finished loading).
+    pub refresh: Rc<dyn Fn()>,
+    /// Move parameter widgets to values edited in a plugin's native window:
+    /// [(plugin cfg_id, param index, value)].
+    pub sync_params: Rc<dyn Fn(&[(u64, u32, f64)])>,
+}
+
+/// Present the dialog; returns it together with the update hooks.
 pub fn open(
     parent: &impl IsA<gtk::Widget>,
     deps: EffectsDeps,
     channel_id: u64,
-) -> (adw::Dialog, Rc<dyn Fn()>) {
+) -> (adw::Dialog, DialogHooks) {
     let channel_name = deps
         .config
         .borrow()
@@ -71,6 +91,8 @@ pub fn open(
         effects_box,
         dialog: dialog.clone(),
         control_debounce: RefCell::new(None),
+        vst_widgets: RefCell::new(HashMap::new()),
+        syncing: Cell::new(false),
     });
 
     rebuild_groups(&state);
@@ -91,11 +113,27 @@ pub fn open(
         let state = state.clone();
         Rc::new(move || rebuild_groups(&state))
     };
-    (dialog, refresh)
+    let sync_params: Rc<dyn Fn(&[(u64, u32, f64)])> = {
+        let state = state.clone();
+        Rc::new(move |updates| {
+            state.syncing.set(true);
+            let widgets = state.vst_widgets.borrow();
+            for (cfg_id, index, value) in updates {
+                match widgets.get(&(*cfg_id, *index)) {
+                    Some(VstParamWidget::Scale(s)) => s.set_value(*value),
+                    Some(VstParamWidget::Switch(sw)) => sw.set_active(*value > 0.5),
+                    None => {}
+                }
+            }
+            state.syncing.set(false);
+        })
+    };
+    (dialog, DialogHooks { refresh, sync_params })
 }
 
 /// (Re)build both groups from config + runtime state.
 fn rebuild_groups(state: &Rc<DialogState>) {
+    state.vst_widgets.borrow_mut().clear();
     while let Some(child) = state.effects_box.first_child() {
         state.effects_box.remove(&child);
     }
@@ -609,13 +647,19 @@ fn vst_param_row(
             .active(value > 0.5)
             .valign(gtk::Align::Center)
             .build();
-        let state = state.clone();
-        sw.connect_state_set(move |_, on| {
-            vst_param_change(&state, vst_id, index, if on { 1.0 } else { 0.0 });
-            glib::Propagation::Proceed
-        });
+        {
+            let state = state.clone();
+            sw.connect_state_set(move |_, on| {
+                vst_param_change(&state, vst_id, index, if on { 1.0 } else { 0.0 });
+                glib::Propagation::Proceed
+            });
+        }
         row.add_suffix(&sw);
         row.set_activatable_widget(Some(&sw));
+        state
+            .vst_widgets
+            .borrow_mut()
+            .insert((vst_id, index), VstParamWidget::Switch(sw));
     } else {
         let min = param.min;
         let max = if param.max > param.min {
@@ -631,17 +675,28 @@ fn vst_param_row(
         scale.set_value_pos(gtk::PositionType::Right);
         scale.set_digits(if param.integer { 0 } else { 2 });
         scale.set_valign(gtk::Align::Center);
-        let state = state.clone();
-        scale.connect_value_changed(move |s| {
-            vst_param_change(&state, vst_id, index, s.value());
-        });
+        {
+            let state = state.clone();
+            scale.connect_value_changed(move |s| {
+                vst_param_change(&state, vst_id, index, s.value());
+            });
+        }
         row.add_suffix(&scale);
+        state
+            .vst_widgets
+            .borrow_mut()
+            .insert((vst_id, index), VstParamWidget::Scale(scale));
     }
     row
 }
 
 /// Persist a VST parameter and (debounced) push it into the running rack.
 fn vst_param_change(state: &Rc<DialogState>, vst_id: u64, index: u32, value: f64) {
+    if state.syncing.get() {
+        // The widget is being moved to a value that came FROM the engine
+        // (edited in the plugin's own window); don't send it back.
+        return;
+    }
     {
         let mut cfg = state.deps.config.borrow_mut();
         if let Some(ch) = cfg.channel_mut(state.channel_id) {
