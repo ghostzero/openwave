@@ -19,6 +19,8 @@ pub struct ChannelStrip {
     pub remove: gtk::Button,
     pub fx: gtk::Button,
     pub input: gtk::DropDown,
+    pub noise: gtk::Switch,
+    noise_row: gtk::Box,
     level: MeterPair,
     pub monitor_scale: gtk::Scale,
     pub stream_scale: gtk::Scale,
@@ -101,6 +103,25 @@ impl ChannelStrip {
         input.set_factory(Some(&label_factory(9, true)));
         input.set_list_factory(Some(&label_factory(36, false)));
 
+        let noise = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .build();
+        let noise_label = gtk::Label::builder()
+            .label("Noise Removal")
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption"])
+            .build();
+        let noise_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .tooltip_text("Suppress background noise on this input (RNNoise)")
+            .visible(false)
+            .build();
+        noise_row.append(&noise_label);
+        noise_row.append(&noise);
+
         let level = meter_pair();
 
         let monitor_scale = fader();
@@ -127,6 +148,7 @@ impl ChannelStrip {
 
         root.append(&header);
         root.append(&input);
+        root.append(&noise_row);
         root.append(&level.root);
         root.append(&faders);
 
@@ -136,6 +158,8 @@ impl ChannelStrip {
             remove,
             fx,
             input,
+            noise,
+            noise_row,
             level,
             monitor_scale,
             stream_scale,
@@ -165,7 +189,18 @@ impl ChannelStrip {
         self.stream_mute.set_active(c.stream_muted);
         self.link.set_active(c.linked);
         self.update_fx_indicator(c);
+        self.update_noise_toggle(c);
         self.guard.set(false);
+    }
+
+    /// Show the noise-suppression switch on capture-source channels and sync
+    /// it with the presence of an enabled RNNoise effect in the chain.
+    pub fn update_noise_toggle(&self, c: &ChannelConfig) {
+        let was = self.guard.replace(true);
+        self.noise_row
+            .set_visible(matches!(c.assignment, Some(Assignment::Source { .. })));
+        self.noise.set_active(c.noise_suppression_active());
+        self.guard.set(was);
     }
 
     /// Tint the FX button while the channel processes through effects.

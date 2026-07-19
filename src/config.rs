@@ -165,6 +165,31 @@ impl ChannelConfig {
         self.effects.iter_mut().find(|e| e.id == effect_id)
     }
 
+    /// Insert an effect at the front of the chain (before everything else)
+    /// and return a reference to it.
+    pub fn insert_effect_front(&mut self, uri: &str, name: &str) -> &EffectConfig {
+        let id = self.next_effect_id;
+        self.next_effect_id += 1;
+        self.effects.insert(
+            0,
+            EffectConfig {
+                id,
+                uri: uri.to_string(),
+                name: name.to_string(),
+                ..EffectConfig::default()
+            },
+        );
+        &self.effects[0]
+    }
+
+    /// Whether the one-click noise suppression is on, i.e. an enabled RNNoise
+    /// effect sits in the chain.
+    pub fn noise_suppression_active(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|e| e.enabled && crate::lv2::is_rnnoise(&e.uri))
+    }
+
     /// Append a VST plugin from a discovery entry.
     pub fn add_vst(&mut self, entry: &crate::vst::VstEntry) -> u64 {
         let id = self.next_effect_id;

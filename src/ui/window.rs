@@ -8,6 +8,7 @@ use gtk::{gio, glib};
 
 use crate::audio::{AudioEvent, LevelTarget, Mix, PulseManager};
 use crate::config::{Assignment, Config, MAX_CHANNELS};
+use crate::lv2;
 
 use super::channel_strip::ChannelStrip;
 use super::effects::{self, EffectsDeps};
@@ -303,17 +304,7 @@ fn wire_audio_events(app: &Rc<App>) {
                 LevelTarget::MonitorMix => app.outputs.monitor_level.set_levels(&v),
                 LevelTarget::StreamMix => app.outputs.stream_level.set_levels(&v),
             },
-            AudioEvent::VstChanged(id) => {
-                let hooks = app
-                    .fx_dialog
-                    .borrow()
-                    .as_ref()
-                    .filter(|(did, _)| *did == id)
-                    .map(|(_, h)| h.clone());
-                if let Some(hooks) = hooks {
-                    (hooks.refresh)();
-                }
-            }
+            AudioEvent::VstChanged(id) => refresh_fx_dialog(&app, id),
             AudioEvent::VstParams(id, updates) => {
                 schedule_save(&app);
                 let hooks = app
@@ -403,6 +394,96 @@ fn update_sidebar(app: &Rc<App>) {
         Assignment::App { name } => format!("{name} — application"),
         Assignment::Virtual => "Virtual device".to_string(),
     });
+}
+
+// ---- Effect chains -------------------------------------------------------------
+
+/// Rebuild the open effects dialog if it shows `id`'s chain.
+fn refresh_fx_dialog(app: &Rc<App>, id: u64) {
+    let hooks = app
+        .fx_dialog
+        .borrow()
+        .as_ref()
+        .filter(|(did, _)| *did == id)
+        .map(|(_, h)| h.clone());
+    if let Some(hooks) = hooks {
+        (hooks.refresh)();
+    }
+}
+
+/// React to a structural change of `id`'s effect chain (add/remove/reorder/
+/// enable): respawn the chain and bring every dependent view up to date.
+fn channel_structure_changed(app: &Rc<App>, id: u64) {
+    app.manager.rebuild_channel(id);
+    schedule_save(app);
+    update_sidebar(app);
+    let cfg = app.config.borrow();
+    if let Some(ch) = cfg.channel(id)
+        && let Some((_, strip)) = app.strips.borrow().iter().find(|(cid, _)| *cid == id)
+    {
+        strip.update_fx_indicator(ch);
+        strip.update_noise_toggle(ch);
+    }
+}
+
+/// Turn one-click noise suppression on: re-enable an RNNoise effect already
+/// in the chain, or insert one at the front. When the plugin (or lilv) is
+/// missing, the switch is reverted and an install hint shown instead.
+fn enable_noise_suppression(app: &Rc<App>, id: u64, sw: &gtk::Switch) {
+    let catalog = lv2::catalog();
+    let plugin = catalog
+        .as_ref()
+        .and_then(|c| lv2::RNNOISE_URIS.iter().find_map(|uri| c.find(uri)));
+    let Some(info) = plugin else {
+        if let Some((_, strip)) = app.strips.borrow().iter().find(|(cid, _)| *cid == id) {
+            let was = strip.guard.replace(true);
+            sw.set_active(false);
+            strip.guard.set(was);
+        }
+        show_noise_suppression_help(sw, catalog.is_none());
+        return;
+    };
+    let (uri, name) = (info.uri.clone(), info.name.clone());
+    {
+        let mut cfg = app.config.borrow_mut();
+        let Some(ch) = cfg.channel_mut(id) else {
+            return;
+        };
+        let mut found = false;
+        for e in ch.effects.iter_mut().filter(|e| lv2::is_rnnoise(&e.uri)) {
+            e.enabled = true;
+            found = true;
+        }
+        if !found {
+            ch.insert_effect_front(&uri, &name);
+        }
+    }
+    channel_structure_changed(app, id);
+    refresh_fx_dialog(app, id);
+}
+
+fn show_noise_suppression_help(parent: &gtk::Switch, lilv_missing: bool) {
+    let missing = if lilv_missing {
+        "the lilv library and the RNNoise plugin (the \u{201c}noise-suppression-for-voice\u{201d} \
+         project), which could not be found"
+    } else {
+        "the RNNoise LV2 plugin (the \u{201c}noise-suppression-for-voice\u{201d} project), \
+         which is not installed"
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading("Noise Suppression Unavailable")
+        .body(format!(
+            "Noise suppression needs {missing}.\n\n\
+             Fedora: sudo dnf install lilv noise-suppression-for-voice \
+             pipewire-module-filter-chain-lv2\n\
+             Arch: sudo pacman -S lilv noise-suppression-for-voice\n\
+             Debian/Ubuntu: install the lilv package, then the LV2 plugin from \
+             github.com/werman/noise-suppression-for-voice\n\n\
+             Afterwards restart OpenWave to pick up the plugin."
+        ))
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.present(Some(parent));
 }
 
 // ---- Channel strips (dynamic) -------------------------------------------------
@@ -516,6 +597,61 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             app.manager.rebuild_channel(id);
             schedule_save(&app);
             update_sidebar(&app);
+            // The noise-suppression switch only shows on capture sources.
+            let cfg = app.config.borrow();
+            if let Some(ch) = cfg.channel(id)
+                && let Some((_, strip)) = app.strips.borrow().iter().find(|(cid, _)| *cid == id)
+            {
+                strip.update_noise_toggle(ch);
+            }
+        });
+    }
+
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        strip.noise.connect_state_set(move |sw, on| {
+            if guard.get() {
+                return glib::Propagation::Proceed;
+            }
+            if on {
+                // Enabling needs the plugin catalog; defer past this handler
+                // (and past a still-running warm-up scan) so the switch can
+                // be reverted cleanly if the plugin turns out to be missing.
+                let app = app.clone();
+                let sw = sw.clone();
+                if lv2::scan_pending() {
+                    lv2::when_ready(move || enable_noise_suppression(&app, id, &sw));
+                } else {
+                    glib::idle_add_local_once(move || {
+                        enable_noise_suppression(&app, id, &sw);
+                    });
+                }
+            } else {
+                let changed = {
+                    let mut cfg = app.config.borrow_mut();
+                    let Some(ch) = cfg.channel_mut(id) else {
+                        return glib::Propagation::Proceed;
+                    };
+                    let mut changed = false;
+                    for e in ch
+                        .effects
+                        .iter_mut()
+                        .filter(|e| e.enabled && lv2::is_rnnoise(&e.uri))
+                    {
+                        // Disable instead of remove so tweaked settings
+                        // survive toggling.
+                        e.enabled = false;
+                        changed = true;
+                    }
+                    changed
+                };
+                if changed {
+                    channel_structure_changed(&app, id);
+                    refresh_fx_dialog(&app, id);
+                }
+            }
+            glib::Propagation::Proceed
         });
     }
 
@@ -635,18 +771,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
         strip.fx.connect_clicked(move |btn| {
             let on_structure = {
                 let app = app.clone();
-                Rc::new(move |id: u64| {
-                    app.manager.rebuild_channel(id);
-                    schedule_save(&app);
-                    update_sidebar(&app);
-                    let cfg = app.config.borrow();
-                    if let Some(ch) = cfg.channel(id)
-                        && let Some((_, strip)) =
-                            app.strips.borrow().iter().find(|(cid, _)| *cid == id)
-                        {
-                            strip.update_fx_indicator(ch);
-                        }
-                })
+                Rc::new(move |id: u64| channel_structure_changed(&app, id))
             };
             let on_control = {
                 let app = app.clone();

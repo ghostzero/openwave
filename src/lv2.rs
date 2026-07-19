@@ -50,6 +50,20 @@ impl Catalog {
     }
 }
 
+/// LV2 URIs of the RNNoise plugin (werman's noise-suppression-for-voice)
+/// backing the one-click noise-suppression toggle, preferred variant first:
+/// the mono build is instantiated once per lane by the filter chain.
+pub const RNNOISE_URIS: [&str; 2] = [
+    "https://github.com/werman/noise-suppression-for-voice#mono",
+    "https://github.com/werman/noise-suppression-for-voice#stereo",
+];
+
+/// Whether an effect is the RNNoise plugin driven by the noise-suppression
+/// toggle.
+pub fn is_rnnoise(uri: &str) -> bool {
+    RNNOISE_URIS.contains(&uri)
+}
+
 /// Host features the PipeWire filter-chain LV2 loader provides; plugins
 /// requiring anything else are hidden from the browser because they would
 /// fail to instantiate.
