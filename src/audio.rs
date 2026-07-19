@@ -77,6 +77,14 @@ pub enum Mix {
     Stream,
 }
 
+/// Addresses one managed loopback, for the fast post-load volume apply.
+#[derive(Clone, Copy)]
+enum LoopbackRef {
+    Mix(u64, Mix),
+    Input(u64),
+    MonitorOut,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LevelTarget {
     Channel(u64),
@@ -108,6 +116,10 @@ pub struct SourceEntry {
     /// Current device volume in percent (avg across channels).
     pub volume: f64,
     pub channels: u8,
+    /// Server-side index, for matching capture streams to their device.
+    pub index: u32,
+    /// Owning sound card, for same-card checks against sinks.
+    pub card: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +129,8 @@ pub struct SinkEntry {
     /// Current device volume in percent (avg across channels).
     pub volume: f64,
     pub channels: u8,
+    /// Owning sound card, for same-card checks against sources.
+    pub card: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,13 +144,34 @@ struct SinkInputEntry {
     mute: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SourceOutputEntry {
+    source: u32,
+    owner_module: Option<u32>,
+}
+
+/// Stream re-attachments queued by a drift check.
+#[derive(Default)]
+struct DriftMoves {
+    /// (sink-input, sink name)
+    sinks: Vec<(u32, String)>,
+    /// (source-output, source name)
+    sources: Vec<(u32, String)>,
+}
+
 #[derive(Default)]
 struct Loopback {
     module: Option<u32>,
     sink_input: Option<u32>,
+    /// The loopback's capture stream, tracked so it can be re-attached when
+    /// it ends up on the wrong device (or unlinked because the device was
+    /// absent when the stream was created).
+    source_output: Option<u32>,
     channels: u8,
     /// Sink this loopback must stay attached to (empty = not enforced yet).
     target: String,
+    /// Source the capture side must stay attached to (empty = not enforced).
+    source_target: String,
 }
 
 /// Wiring deferred until the channel's FX bridge nodes show up on the
@@ -161,6 +196,9 @@ struct ChannelRuntime {
     /// loopback targets, so the rack taps this sink's monitor via pw-link).
     vstin_module: Option<u32>,
     pending_wire: Option<PendingWire>,
+    /// Configured capture source that is not on the server yet; the channel
+    /// is wired as soon as it appears (USB devices enumerate late at login).
+    pending_source: Option<String>,
     monitor_loop: Loopback,
     stream_loop: Loopback,
 }
@@ -177,6 +215,7 @@ struct Inner {
     sinks: Vec<(u32, SinkEntry)>,
     sources: Vec<SourceEntry>,
     sink_inputs: HashMap<u32, SinkInputEntry>,
+    source_outputs: HashMap<u32, SourceOutputEntry>,
     default_sink: Option<String>,
     default_source: Option<String>,
     /// Per-channel runtime state, keyed by the channel's stable config id.
@@ -186,6 +225,11 @@ struct Inner {
     monitor_out: Loopback,
     monitor_out_generation: u64,
     monitor_out_pending: bool,
+    /// Suppresses monitor-out creation while capture wiring is settling.
+    /// The Wave XLR's firmware delivers a silent mic when its playback
+    /// stream is opened before its capture stream, so capture must come up
+    /// first; see check_pending_sources / source_channels_settled.
+    monitor_out_deferred: bool,
     peaks: HashMap<LevelTarget, Rc<RefCell<Stream>>>,
     refresh_queued: bool,
 }
@@ -268,12 +312,14 @@ impl PulseManager {
             inner.fx.shutdown_all();
             inner.monitor_out = Loopback::default();
             inner.monitor_out_pending = false;
+            inner.monitor_out_deferred = false;
             for (_, s) in inner.peaks.drain() {
                 Self::drop_peak(&s);
             }
             inner.sinks.clear();
             inner.sources.clear();
             inner.sink_inputs.clear();
+            inner.source_outputs.clear();
             inner.refresh_queued = false;
             inner.context = None;
             inner.mainloop = None;
@@ -618,6 +664,7 @@ impl PulseManager {
                             Facility::Sink
                                 | Facility::Source
                                 | Facility::SinkInput
+                                | Facility::SourceOutput
                                 | Facility::Server
                         )
                     ) {
@@ -628,6 +675,7 @@ impl PulseManager {
                 InterestMaskSet::SINK
                     | InterestMaskSet::SOURCE
                     | InterestMaskSet::SINK_INPUT
+                    | InterestMaskSet::SOURCE_OUTPUT
                     | InterestMaskSet::SERVER,
                 |_| {},
             );
@@ -729,7 +777,11 @@ impl PulseManager {
                 return;
             }
             inner.ready = true;
+            // Hold back the monitor-out playback until the capture loopbacks
+            // are up (capture-before-playback; see monitor_out_deferred).
+            inner.monitor_out_deferred = true;
         }
+        Self::monitor_out_defer_timeout(rc);
         Self::emit(rc, AudioEvent::Ready);
         Self::create_stream_mic(rc);
         let ids: Vec<u64> = {
@@ -765,6 +817,26 @@ impl PulseManager {
                 return;
             }
             rc.borrow_mut().owned_modules.insert(idx);
+        });
+    }
+
+    /// Safety valve for `monitor_out_deferred`: never leave the user without
+    /// monitor audio when capture wiring stalls (device absent, slow FX
+    /// spawn, LV2 warm-up). A stale timeout can at worst clear a later
+    /// deferral early, which merely restores today's playback-first order.
+    fn monitor_out_defer_timeout(rc: &Rc<RefCell<Inner>>) {
+        let weak = Rc::downgrade(rc);
+        glib::timeout_add_local_once(std::time::Duration::from_secs(8), move || {
+            let Some(rc) = weak.upgrade() else {
+                return;
+            };
+            let expired = {
+                let mut inner = rc.borrow_mut();
+                std::mem::replace(&mut inner.monitor_out_deferred, false)
+            };
+            if expired {
+                Self::schedule_refresh(&rc);
+            }
         });
     }
 
@@ -818,6 +890,7 @@ impl PulseManager {
                             volume: 100.0 * f64::from(s.volume.avg().0)
                                 / f64::from(Volume::NORMAL.0),
                             channels: s.volume.len(),
+                            card: s.card,
                         },
                     ));
                 }
@@ -852,6 +925,8 @@ impl PulseManager {
                         volume: 100.0 * f64::from(s.volume.avg().0)
                             / f64::from(Volume::NORMAL.0),
                         channels: s.volume.len(),
+                        index: s.index,
+                        card: s.card,
                         name,
                     });
                 }
@@ -896,40 +971,172 @@ impl PulseManager {
                     return;
                 };
                 rc.borrow_mut().sink_inputs = acc.take();
-                Self::match_pending_loopbacks(&rc);
-                Self::reconcile_apps(&rc);
-                Self::check_pending_wires(&rc);
-                {
-                    let inner = rc.borrow();
-                    if inner.ready
-                        && inner.monitor_out.module.is_none()
-                        && !inner.monitor_out_pending
-                    {
-                        drop(inner);
-                        Self::setup_monitor_output_inner(&rc);
-                    }
-                }
-                Self::emit(&rc, AudioEvent::DevicesChanged);
+                Self::refresh_source_outputs(&rc);
             }
         });
     }
 
-    /// Associate freshly loaded loopback modules with the sink-input they
-    /// created, then enforce the configured volume/mute on every managed
-    /// loopback that drifted. Session managers (e.g. WirePlumber's
-    /// stream-restore) may asynchronously overwrite stream volumes right
-    /// after creation; re-checking on every sink-input refresh converges
+    fn refresh_source_outputs(rc: &Rc<RefCell<Inner>>) {
+        let Some(intro) = Self::introspect(rc) else {
+            return;
+        };
+        let weak = Rc::downgrade(rc);
+        let acc: Rc<RefCell<HashMap<u32, SourceOutputEntry>>> = Rc::default();
+        let _ = intro.get_source_output_info_list(move |res| match res {
+            ListResult::Item(so) => {
+                acc.borrow_mut().insert(
+                    so.index,
+                    SourceOutputEntry {
+                        source: so.source,
+                        owner_module: so.owner_module,
+                    },
+                );
+            }
+            ListResult::End | ListResult::Error => {
+                let Some(rc) = weak.upgrade() else {
+                    return;
+                };
+                rc.borrow_mut().source_outputs = acc.take();
+                Self::finish_refresh(&rc);
+            }
+        });
+    }
+
+    /// Reconciliation pass run once a refresh cycle has landed all lists.
+    fn finish_refresh(rc: &Rc<RefCell<Inner>>) {
+        Self::check_pending_sources(rc);
+        Self::match_pending_loopbacks(rc);
+        Self::reconcile_apps(rc);
+        Self::check_pending_wires(rc);
+        let action = {
+            let mut inner = rc.borrow_mut();
+            if inner.monitor_out_deferred && Self::source_channels_settled(&inner) {
+                inner.monitor_out_deferred = false;
+            }
+            let usable =
+                inner.ready && !inner.monitor_out_pending && !inner.monitor_out_deferred;
+            // Also re-run setup when the configured monitor device appeared
+            // after monitor-out fell back to another sink.
+            let retarget = || {
+                let cfg = inner.config.borrow();
+                cfg.master.monitor_device.as_ref().is_some_and(|d| {
+                    *d != inner.monitor_out.target
+                        && inner.sinks.iter().any(|(_, e)| &e.name == d)
+                })
+            };
+            usable && (inner.monitor_out.module.is_none() || retarget())
+        };
+        if action {
+            Self::setup_monitor_output_inner(rc);
+        }
+        Self::emit(rc, AudioEvent::DevicesChanged);
+    }
+
+    /// Every `Source` channel either has its capture loopback running or is
+    /// parked waiting for a device that is not on the server.
+    fn source_channels_settled(inner: &Inner) -> bool {
+        let cfg = inner.config.borrow();
+        cfg.channels.iter().all(|c| {
+            if !matches!(c.assignment, Some(Assignment::Source { .. })) {
+                return true;
+            }
+            inner.channels.get(&c.id).is_some_and(|rt| {
+                rt.pending_source.is_some()
+                    || rt.monitor_loop.sink_input.is_some()
+                    || rt.input_loop.sink_input.is_some()
+            })
+        })
+    }
+
+    /// Wire channels parked on a capture device that has now appeared. If
+    /// the monitor output plays (or is configured to play) on the same card,
+    /// tear it down first and let the deferral logic recreate it once the
+    /// capture loopbacks run: the Wave XLR's firmware delivers a silent mic
+    /// when its playback stream is opened before its capture stream.
+    fn check_pending_sources(rc: &Rc<RefCell<Inner>>) {
+        let (ready_ids, bounce) = {
+            let inner = rc.borrow();
+            if !inner.ready || inner.shutting_down {
+                return;
+            }
+            let mut ids = Vec::new();
+            let mut cards = Vec::new();
+            for (&id, rt) in &inner.channels {
+                let Some(p) = &rt.pending_source else {
+                    continue;
+                };
+                if let Some(s) = inner.sources.iter().find(|s| &s.name == p) {
+                    ids.push(id);
+                    if s.card.is_some() {
+                        cards.push(s.card);
+                    }
+                }
+            }
+            let bounce = !ids.is_empty() && inner.monitor_out.module.is_some() && {
+                let cfg = inner.config.borrow();
+                let configured = cfg.master.monitor_device.clone();
+                [Some(inner.monitor_out.target.clone()), configured]
+                    .iter()
+                    .flatten()
+                    .any(|t| {
+                        let tc = inner
+                            .sinks
+                            .iter()
+                            .find(|(_, e)| &e.name == t)
+                            .and_then(|(_, e)| e.card);
+                        tc.is_some() && cards.contains(&tc)
+                    })
+            };
+            (ids, bounce)
+        };
+        if ready_ids.is_empty() {
+            return;
+        }
+        if bounce {
+            let old = {
+                let mut inner = rc.borrow_mut();
+                inner.monitor_out_generation += 1;
+                inner.monitor_out_deferred = true;
+                let m = inner.monitor_out.module.take();
+                if let Some(m) = m {
+                    inner.owned_modules.remove(&m);
+                }
+                inner.monitor_out.sink_input = None;
+                inner.monitor_out.source_output = None;
+                m
+            };
+            Self::monitor_out_defer_timeout(rc);
+            if let Some(m) = old
+                && let Some(mut intro) = Self::introspect(rc) {
+                    let _ = intro.unload_module(m, |_| {});
+                }
+        }
+        for id in ready_ids {
+            Self::rebuild_channel_inner(rc, id);
+        }
+    }
+
+    /// Associate freshly loaded loopback modules with the sink-input and
+    /// source-output they created, then enforce the configured volume/mute
+    /// on every managed loopback that drifted. Session managers (e.g.
+    /// WirePlumber's stream-restore) may asynchronously overwrite stream
+    /// volumes right after creation; re-checking on every refresh converges
     /// back to our state because we only write on mismatch.
     fn match_pending_loopbacks(rc: &Rc<RefCell<Inner>>) {
         let mut applies: Vec<(Option<u64>, Mix)> = Vec::new();
         let mut input_applies: Vec<u64> = Vec::new();
-        let mut moves: Vec<(u32, String)> = Vec::new();
+        let mut moves = DriftMoves::default();
         {
             let mut inner = rc.borrow_mut();
             let by_module: HashMap<u32, (u32, u8)> = inner
                 .sink_inputs
                 .values()
                 .filter_map(|e| e.owner_module.map(|m| (m, (e.index, e.channels))))
+                .collect();
+            let so_by_module: HashMap<u32, u32> = inner
+                .source_outputs
+                .iter()
+                .filter_map(|(&idx, e)| e.owner_module.map(|m| (m, idx)))
                 .collect();
             let ids: Vec<u64> = inner.channels.keys().copied().collect();
             for &id in &ids {
@@ -941,28 +1148,25 @@ impl PulseManager {
                     &mut rt.stream_loop,
                     &mut rt.input_loop,
                 ] {
-                    if let (Some(m), None) = (l.module, l.sink_input)
-                        && let Some(&(si, chans)) = by_module.get(&m) {
-                            l.sink_input = Some(si);
-                            l.channels = chans;
-                        }
+                    Self::match_loopback(l, &by_module, &so_by_module);
                 }
             }
-            let l = &mut inner.monitor_out;
-            if let (Some(m), None) = (l.module, l.sink_input)
-                && let Some(&(si, chans)) = by_module.get(&m) {
-                    l.sink_input = Some(si);
-                    l.channels = chans;
-                }
+            let mo = &mut inner.monitor_out;
+            Self::match_loopback(mo, &by_module, &so_by_module);
 
             // Detect drift between the server state and our desired state:
             // wrong volume/mute is re-applied, a loopback attached to the
-            // wrong sink is moved back to its intended target.
+            // wrong sink or capture source is moved back to its target.
             let cfg = inner.config.borrow();
             let sink_names: HashMap<u32, &str> = inner
                 .sinks
                 .iter()
                 .map(|(i, e)| (*i, e.name.as_str()))
+                .collect();
+            let source_names: HashMap<u32, &str> = inner
+                .sources
+                .iter()
+                .map(|s| (s.index, s.name.as_str()))
                 .collect();
             for c in &cfg.channels {
                 let Some(rt) = inner.channels.get(&c.id) else {
@@ -980,12 +1184,19 @@ impl PulseManager {
                             c.stream_muted || cfg.master.stream_muted,
                         ),
                     };
-                    Self::check_drift(&inner, l, vol, mute, &sink_names, &mut moves)
+                    Self::check_drift(&inner, l, vol, mute, &sink_names, &source_names, &mut moves)
                         .then(|| applies.push((Some(c.id), mix)));
                 }
                 // The FX input loopback always runs at unity gain.
-                if Self::check_drift(&inner, &rt.input_loop, 1.0, false, &sink_names, &mut moves)
-                {
+                if Self::check_drift(
+                    &inner,
+                    &rt.input_loop,
+                    1.0,
+                    false,
+                    &sink_names,
+                    &source_names,
+                    &mut moves,
+                ) {
                     input_applies.push(c.id);
                 }
             }
@@ -995,15 +1206,19 @@ impl PulseManager {
                 cfg.master.monitor_volume,
                 cfg.master.monitor_muted,
                 &sink_names,
+                &source_names,
                 &mut moves,
             ) {
                 applies.push((None, Mix::Monitor));
             }
         }
-        if !moves.is_empty()
+        if (!moves.sinks.is_empty() || !moves.sources.is_empty())
             && let Some(mut intro) = Self::introspect(rc) {
-                for (si, sink) in moves {
+                for (si, sink) in moves.sinks {
                     let _ = intro.move_sink_input_by_name(si, &sink, None);
+                }
+                for (so, source) in moves.sources {
+                    let _ = intro.move_source_output_by_name(so, &source, None);
                 }
             }
         for (id, mix) in applies {
@@ -1015,6 +1230,78 @@ impl PulseManager {
         for id in input_applies {
             Self::apply_input_loop_inner(rc, id);
         }
+    }
+
+    /// Fast path after a loopback module loads: look up only the sink-input
+    /// it created and apply the configured volume/mute right away instead of
+    /// waiting for the debounced full refresh — the shorter the window where
+    /// the stream plays at its default level, the smaller the audible pop
+    /// when a channel is (re)wired. No reconciliation happens here:
+    /// list-wide healing (drift moves, app stream moves) must only ever run
+    /// on a consistent snapshot of all lists, i.e. in finish_refresh.
+    fn apply_new_loopback(rc: &Rc<RefCell<Inner>>, which: LoopbackRef, module: u32) {
+        let Some(intro) = Self::introspect(rc) else {
+            return;
+        };
+        let weak = Rc::downgrade(rc);
+        let found: Rc<Cell<Option<(u32, u8)>>> = Rc::default();
+        let _ = intro.get_sink_input_info_list(move |res| match res {
+            ListResult::Item(si) => {
+                if si.owner_module == Some(module) {
+                    found.set(Some((si.index, si.volume.len())));
+                }
+            }
+            ListResult::End | ListResult::Error => {
+                let Some(rc) = weak.upgrade() else {
+                    return;
+                };
+                let Some((si, chans)) = found.get() else {
+                    return;
+                };
+                {
+                    let mut inner = rc.borrow_mut();
+                    let l = match which {
+                        LoopbackRef::Mix(id, mix) => {
+                            inner.channels.get_mut(&id).map(|rt| match mix {
+                                Mix::Monitor => &mut rt.monitor_loop,
+                                Mix::Stream => &mut rt.stream_loop,
+                            })
+                        }
+                        LoopbackRef::Input(id) => {
+                            inner.channels.get_mut(&id).map(|rt| &mut rt.input_loop)
+                        }
+                        LoopbackRef::MonitorOut => Some(&mut inner.monitor_out),
+                    };
+                    // The loopback may have been rebuilt meanwhile.
+                    let Some(l) = l.filter(|l| l.module == Some(module)) else {
+                        return;
+                    };
+                    l.sink_input = Some(si);
+                    l.channels = chans;
+                }
+                match which {
+                    LoopbackRef::Mix(id, mix) => Self::apply_channel_mix_inner(&rc, id, mix),
+                    LoopbackRef::Input(id) => Self::apply_input_loop_inner(&rc, id),
+                    LoopbackRef::MonitorOut => Self::apply_master_monitor_inner(&rc),
+                }
+            }
+        });
+    }
+
+    fn match_loopback(
+        l: &mut Loopback,
+        by_module: &HashMap<u32, (u32, u8)>,
+        so_by_module: &HashMap<u32, u32>,
+    ) {
+        if let (Some(m), None) = (l.module, l.sink_input)
+            && let Some(&(si, chans)) = by_module.get(&m) {
+                l.sink_input = Some(si);
+                l.channels = chans;
+            }
+        if let (Some(m), None) = (l.module, l.source_output)
+            && let Some(&so) = so_by_module.get(&m) {
+                l.source_output = Some(so);
+            }
     }
 
     /// Re-assert unity gain on a channel's FX input loopback.
@@ -1038,15 +1325,26 @@ impl PulseManager {
     }
 
     /// Returns true when volume/mute must be re-applied; queues a move when
-    /// the loopback sits on the wrong sink.
+    /// the loopback sits on the wrong sink, or its capture stream on the
+    /// wrong source (only when the intended source actually exists — after
+    /// a device replug the stream may briefly point nowhere).
     fn check_drift(
         inner: &Inner,
         l: &Loopback,
         vol: f64,
         mute: bool,
         sink_names: &HashMap<u32, &str>,
-        moves: &mut Vec<(u32, String)>,
+        source_names: &HashMap<u32, &str>,
+        moves: &mut DriftMoves,
     ) -> bool {
+        if !l.source_target.is_empty()
+            && let Some(so) = l.source_output
+            && let Some(entry) = inner.source_outputs.get(&so)
+            && source_names.get(&entry.source).copied() != Some(l.source_target.as_str())
+            && inner.sources.iter().any(|s| s.name == l.source_target)
+        {
+            moves.sources.push((so, l.source_target.clone()));
+        }
         let Some(si) = l.sink_input else {
             return false;
         };
@@ -1056,7 +1354,7 @@ impl PulseManager {
         if !l.target.is_empty()
             && sink_names.get(&entry.sink).copied() != Some(l.target.as_str())
         {
-            moves.push((si, l.target.clone()));
+            moves.sinks.push((si, l.target.clone()));
         }
         let desired = volume_cv(l.channels, vol).avg().0;
         entry.volume_raw.abs_diff(desired) > 1 || entry.mute != mute
@@ -1124,19 +1422,18 @@ impl PulseManager {
             rt.generation += 1;
             let generation_id = rt.generation;
             rt.pending_wire = None;
+            rt.pending_source = None;
             let mut to_unload = Vec::new();
-            if let Some(m) = rt.monitor_loop.module.take() {
-                to_unload.push(m);
+            for l in [
+                &mut rt.monitor_loop,
+                &mut rt.stream_loop,
+                &mut rt.input_loop,
+            ] {
+                if let Some(m) = l.module.take() {
+                    to_unload.push(m);
+                }
+                *l = Loopback::default();
             }
-            rt.monitor_loop.sink_input = None;
-            if let Some(m) = rt.stream_loop.module.take() {
-                to_unload.push(m);
-            }
-            rt.stream_loop.sink_input = None;
-            if let Some(m) = rt.input_loop.module.take() {
-                to_unload.push(m);
-            }
-            rt.input_loop.sink_input = None;
             if let Some(m) = rt.vstin_module.take() {
                 to_unload.push(m);
             }
@@ -1182,7 +1479,18 @@ impl PulseManager {
                 inner.fx.kill_vst(id);
             }
             Some(Assignment::Source { name }) => {
-                Self::wire_channel_input(rc, id, generation_id, &name);
+                let present = rc.borrow().sources.iter().any(|s| s.name == name);
+                if present {
+                    Self::wire_channel_input(rc, id, generation_id, &name);
+                } else {
+                    // Not on the server (yet): USB mics can enumerate
+                    // seconds after login. Park the channel;
+                    // check_pending_sources wires it when the device
+                    // shows up.
+                    if let Some(rt) = rc.borrow_mut().channels.get_mut(&id) {
+                        rt.pending_source = Some(name);
+                    }
+                }
             }
             // App channels and standalone virtual channels both expose a
             // selectable device named after the channel; apps can be routed
@@ -1461,6 +1769,7 @@ impl PulseManager {
         let tag = format!("OpenWave ch{id} fx-in");
         let args = loopback_args(source, sink, &tag);
         let sink = sink.to_string();
+        let source = source.to_string();
         let weak = Rc::downgrade(rc);
         let _ = intro.load_module("module-loopback", &args, move |idx| {
             let Some(rc) = weak.upgrade() else {
@@ -1487,11 +1796,15 @@ impl PulseManager {
                 let mut inner = rc.borrow_mut();
                 inner.owned_modules.insert(idx);
                 if let Some(rt) = inner.channels.get_mut(&id) {
-                    rt.input_loop.module = Some(idx);
-                    rt.input_loop.sink_input = None;
-                    rt.input_loop.target = sink.clone();
+                    rt.input_loop = Loopback {
+                        module: Some(idx),
+                        target: sink.clone(),
+                        source_target: source.clone(),
+                        ..Loopback::default()
+                    };
                 }
             }
+            Self::apply_new_loopback(&rc, LoopbackRef::Input(id), idx);
             Self::schedule_refresh(&rc);
         });
     }
@@ -1500,6 +1813,7 @@ impl PulseManager {
         let Some(mut intro) = Self::introspect(rc) else {
             return;
         };
+        let source_owned = source.to_string();
         for mix in [Mix::Monitor, Mix::Stream] {
             let sink = match mix {
                 Mix::Monitor => MONITOR_SINK,
@@ -1513,6 +1827,7 @@ impl PulseManager {
                 }
             );
             let args = loopback_args(source, sink, &tag);
+            let source = source_owned.clone();
             let weak = Rc::downgrade(rc);
             let _ = intro.load_module("module-loopback", &args, move |idx| {
                 let Some(rc) = weak.upgrade() else {
@@ -1543,11 +1858,15 @@ impl PulseManager {
                             Mix::Monitor => &mut rt.monitor_loop,
                             Mix::Stream => &mut rt.stream_loop,
                         };
-                        l.module = Some(idx);
-                        l.sink_input = None;
-                        l.target = sink.to_string();
+                        *l = Loopback {
+                            module: Some(idx),
+                            target: sink.to_string(),
+                            source_target: source.clone(),
+                            ..Loopback::default()
+                        };
                     }
                 }
+                Self::apply_new_loopback(&rc, LoopbackRef::Mix(id, mix), idx);
                 Self::schedule_refresh(&rc);
             });
         }
@@ -1561,11 +1880,13 @@ impl PulseManager {
             }
             inner.monitor_out_generation += 1;
             inner.monitor_out_pending = false;
+            inner.monitor_out_deferred = false;
             let old = inner.monitor_out.module.take();
             if let Some(m) = old {
                 inner.owned_modules.remove(&m);
             }
             inner.monitor_out.sink_input = None;
+            inner.monitor_out.source_output = None;
             let configured = inner.config.borrow().master.monitor_device.clone();
             let target = configured
                 .filter(|d| inner.sinks.iter().any(|(_, e)| &e.name == d))
@@ -1614,9 +1935,14 @@ impl PulseManager {
             {
                 let mut inner = rc.borrow_mut();
                 inner.owned_modules.insert(idx);
-                inner.monitor_out.module = Some(idx);
-                inner.monitor_out.target = target.clone();
+                inner.monitor_out = Loopback {
+                    module: Some(idx),
+                    target: target.clone(),
+                    source_target: format!("{MONITOR_SINK}.monitor"),
+                    ..Loopback::default()
+                };
             }
+            Self::apply_new_loopback(&rc, LoopbackRef::MonitorOut, idx);
             Self::schedule_refresh(&rc);
         });
     }

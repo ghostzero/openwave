@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -44,8 +44,10 @@ struct App {
     setup_prompted: Cell<bool>,
     /// Wave XLR volumes were restored for the current device appearance;
     /// reset when the device disappears so a replug restores them again.
-    xlr_mic_restored: Cell<bool>,
-    xlr_out_restored: Cell<bool>,
+    /// Enforcement deadlines for the stored Wave XLR startup volumes; None
+    /// while the device is absent, set on each appearance.
+    xlr_mic_hold: Cell<Option<Instant>>,
+    xlr_out_hold: Cell<Option<Instant>>,
     /// Forces every strip and the add-channel card to the same width.
     strip_size_group: gtk::SizeGroup,
 }
@@ -212,8 +214,8 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         fx_dialog: RefCell::new(None),
         setup_hook: RefCell::new(None),
         setup_prompted: Cell::new(false),
-        xlr_mic_restored: Cell::new(false),
-        xlr_out_restored: Cell::new(false),
+        xlr_mic_hold: Cell::new(None),
+        xlr_out_hold: Cell::new(None),
         strip_size_group,
     });
 
@@ -881,32 +883,56 @@ fn open_wave_xlr(app: &Rc<App>) {
     );
 }
 
-/// Re-apply the stored Wave XLR volumes once per device appearance (startup
-/// and every replug), working around the device forgetting its levels.
+/// How long the stored Wave XLR startup volumes are enforced after startup
+/// or a device (re)appearance. A single write is not enough: the device's
+/// node suspends/resumes while the channels wire up, WirePlumber re-applies
+/// its own stored route volumes on activation, and the firmware itself
+/// occasionally resets to 100% — whichever write lands last wins, so during
+/// this window every refresh that shows a drifted volume re-applies ours
+/// (each reset raises a change event, so no polling is needed). Afterwards
+/// the device's physical controls are left alone.
+const XLR_ENFORCE_WINDOW: Duration = Duration::from_secs(15);
+
 fn restore_wave_xlr(app: &Rc<App>) {
     let (mic, out) = {
         let cfg = app.config.borrow();
         (cfg.wave_xlr.mic_volume, cfg.wave_xlr.output_volume)
     };
-    match app.manager.wave_xlr_source() {
-        Some(src) => {
-            if !app.xlr_mic_restored.replace(true)
-                && let Some(pct) = mic
-            {
-                app.manager.set_source_volume(&src.name, pct);
-            }
+    let mic_dev = app.manager.wave_xlr_source().map(|s| (s.name, s.volume));
+    let out_dev = app.manager.wave_xlr_sink().map(|s| (s.name, s.volume));
+    enforce_xlr_volume(mic_dev, mic, &app.xlr_mic_hold, |name, pct| {
+        app.manager.set_source_volume(name, pct);
+    });
+    enforce_xlr_volume(out_dev, out, &app.xlr_out_hold, |name, pct| {
+        app.manager.set_sink_volume(name, pct);
+    });
+}
+
+fn enforce_xlr_volume(
+    dev: Option<(String, f64)>,
+    stored: Option<f64>,
+    hold: &Cell<Option<Instant>>,
+    apply: impl Fn(&str, f64),
+) {
+    let Some((name, current)) = dev else {
+        hold.set(None);
+        return;
+    };
+    let deadline = match hold.get() {
+        Some(d) => d,
+        None => {
+            let d = Instant::now() + XLR_ENFORCE_WINDOW;
+            hold.set(Some(d));
+            d
         }
-        None => app.xlr_mic_restored.set(false),
+    };
+    if Instant::now() > deadline {
+        return;
     }
-    match app.manager.wave_xlr_sink() {
-        Some(snk) => {
-            if !app.xlr_out_restored.replace(true)
-                && let Some(pct) = out
-            {
-                app.manager.set_sink_volume(&snk.name, pct);
-            }
-        }
-        None => app.xlr_out_restored.set(false),
+    if let Some(pct) = stored
+        && (current - pct).abs() > 1.0
+    {
+        apply(&name, pct);
     }
 }
 
