@@ -73,6 +73,24 @@ Optional, for effects:
   discovered in `~/vst`, `~/.vst`, `~/.lxvst`, `~/.vst3`, the system
   `vst`/`vst3` folders, and `$VST_PATH`/`$VST3_PATH`.
 
+## Installing
+
+### Fedora (COPR)
+
+```sh
+sudo dnf copr enable ghostzero/openwave
+sudo dnf install openwave
+```
+
+### Arch Linux (AUR)
+
+```sh
+yay -S openwave        # or paru -S openwave, or build manually:
+git clone https://aur.archlinux.org/openwave.git && cd openwave && makepkg -si
+```
+
+### From source
+
 Build dependencies (Fedora):
 
 ```sh
@@ -85,7 +103,7 @@ Build dependencies (Debian/Ubuntu):
 sudo apt install libgtk-4-dev libadwaita-1-dev libpulse-dev
 ```
 
-## Building and installing
+Then:
 
 ```sh
 make            # cargo build --release

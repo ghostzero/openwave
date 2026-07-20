@@ -1,0 +1,46 @@
+name: Release assets
+
+# Builds and checks the release, then attaches a `cargo vendor` tarball
+# (for offline distro builds) and checksums to the GitHub release.
+# Releases themselves are still created manually with `gh release create`.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build dependencies
+        run: >
+          dnf -y install cargo rust clippy gcc gtk4-devel libadwaita-devel
+          pulseaudio-libs-devel desktop-file-utils make git-core gh tar xz
+
+      - uses: actions/checkout@v4
+
+      - name: Check
+        run: make check
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create vendor tarball
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          cargo vendor --locked vendor >/dev/null
+          tar -cJf "openwave-$version-vendor.tar.xz" vendor
+          sha256sum "openwave-$version-vendor.tar.xz" > SHA256SUMS
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload "${{ github.event.release.tag_name }}"
+          openwave-*-vendor.tar.xz SHA256SUMS
+          --clobber -R "${{ github.repository }}"
