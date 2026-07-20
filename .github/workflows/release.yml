@@ -62,8 +62,7 @@ jobs:
           # Discord embeds don't render markdown headings; turn them into bold
           notes=$(printf '%s' "$BODY" | sed -E 's/^#{1,3} +(.*)/**\1**/')
           jq -n --arg tag "$TAG" --arg url "$URL" --arg notes "$notes" --arg ts "$PUBLISHED" '
-            {username: "OpenWave Releases",
-             content: "🚀 **OpenWave \($tag) is out!**",
+            {content: "🚀 **OpenWave \($tag) is out!**",
              embeds: [{
                title: "OpenWave \($tag)",
                url: $url,
