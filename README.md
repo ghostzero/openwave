@@ -75,14 +75,14 @@ Optional, for effects:
 
 ## Installing
 
-### Fedora (COPR)
+### Fedora (COPR) — coming soon
 
 ```sh
 sudo dnf copr enable ghostzero/openwave
 sudo dnf install openwave
 ```
 
-### Arch Linux (AUR)
+### Arch Linux (AUR) — coming soon
 
 ```sh
 yay -S openwave        # or paru -S openwave, or build manually:
