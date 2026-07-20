@@ -13,13 +13,14 @@ permissions:
 
 jobs:
   assets:
+    if: github.repository == 'ghostzero/openwave'
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
       - name: Install build dependencies
         run: >
           dnf -y install cargo rust clippy gcc gtk4-devel libadwaita-devel
-          pulseaudio-libs-devel desktop-file-utils make git-core gh tar xz
+          pulseaudio-libs-devel desktop-file-utils make git-core gh tar xz jq
 
       - uses: actions/checkout@v4
 
@@ -44,3 +45,40 @@ jobs:
           gh release upload "${{ github.event.release.tag_name }}"
           openwave-*-vendor.tar.xz SHA256SUMS
           --clobber -R "${{ github.repository }}"
+
+      - name: Announce on Discord
+        if: github.event_name == 'release' && !github.event.release.prerelease
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TAG: ${{ github.event.release.tag_name }}
+          URL: ${{ github.event.release.html_url }}
+          BODY: ${{ github.event.release.body }}
+          PUBLISHED: ${{ github.event.release.published_at }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK_URL not set, skipping announcement"
+            exit 0
+          fi
+          # Discord embeds don't render markdown headings; turn them into bold
+          notes=$(printf '%s' "$BODY" | sed -E 's/^#{1,3} +(.*)/**\1**/')
+          jq -n --arg tag "$TAG" --arg url "$URL" --arg notes "$notes" --arg ts "$PUBLISHED" '
+            {username: "OpenWave Releases",
+             content: "🚀 **OpenWave \($tag) is out!**",
+             embeds: [{
+               title: "OpenWave \($tag)",
+               url: $url,
+               description: ($notes | if length > 4096 then .[:4093] + "…" else . end),
+               color: 5793266,
+               fields: [
+                 {name: "📥 Get it",
+                  value: "```sh\ngit clone https://github.com/ghostzero/openwave\ncd openwave && make install\n```",
+                  inline: true},
+                 {name: "🔗 Links",
+                  value: "[Release notes](\($url))\n[Report an issue](https://github.com/ghostzero/openwave/issues)",
+                  inline: true}
+               ],
+               image: {url: "https://raw.githubusercontent.com/ghostzero/openwave/main/img.png"},
+               footer: {text: "OpenWave — dual-mix virtual audio mixer for Linux • MIT"},
+               timestamp: $ts
+             }]}' \
+          | curl -sf -H "Content-Type: application/json" -d @- "$WEBHOOK"
