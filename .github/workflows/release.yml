@@ -20,7 +20,8 @@ jobs:
       - name: Install build dependencies
         run: >
           dnf -y install cargo rust clippy gcc gtk4-devel libadwaita-devel
-          pulseaudio-libs-devel desktop-file-utils make git-core gh tar xz jq
+          pulseaudio-libs-devel alsa-lib-devel desktop-file-utils make
+          git-core gh tar xz jq
 
       - uses: actions/checkout@v4
 
