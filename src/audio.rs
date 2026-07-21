@@ -5,9 +5,9 @@
 //!
 //! ```text
 //!  capture source ──┬── module-loopback ──▶ OpenWave_Monitor ── loopback ──▶ headphones
-//!  (or app stream    └── module-loopback ──▶ OpenWave_Stream  (captured by OBS/Discord)
-//!   moved into a
-//!   per-channel
+//!  (or app stream    ├── module-loopback ──▶ OpenWave_Stream  (captured by OBS/Discord)
+//!   moved into a     └── module-loopback ──▶ OpenWave_Vod     (optional third bus for a
+//!   per-channel                                                DMCA-safe VOD/recording track)
 //!   null sink)
 //! ```
 //!
@@ -31,13 +31,15 @@ use pulse::sample::{Format, Spec};
 use pulse::stream::{FlagSet as StreamFlagSet, PeekResult, Stream};
 use pulse::volume::{ChannelVolumes, Volume};
 
-use crate::config::{Assignment, Config};
+use crate::config::{Assignment, ChannelConfig, Config, MasterConfig};
 use crate::fx::{self, FxEvent, FxManager};
 use crate::lv2;
 
 pub const MONITOR_SINK: &str = "OpenWave_Monitor";
 pub const STREAM_SINK: &str = "OpenWave_Stream";
 pub const STREAM_MIC: &str = "OpenWave_StreamMic";
+pub const VOD_SINK: &str = "OpenWave_Vod";
+pub const VOD_MIC: &str = "OpenWave_VodMic";
 const OWN_PREFIX: &str = "OpenWave_";
 const LOOPBACK_ARGS: &str = "latency_msec=30";
 const INVALID_INDEX: u32 = u32::MAX;
@@ -75,6 +77,8 @@ fn loopback_args(source: &str, sink: &str, tag: &str) -> String {
 pub enum Mix {
     Monitor,
     Stream,
+    /// Optional third bus for a VOD-safe recording track.
+    Vod,
 }
 
 /// Addresses one managed loopback, for the fast post-load volume apply.
@@ -90,6 +94,7 @@ pub enum LevelTarget {
     Channel(u64),
     MonitorMix,
     StreamMix,
+    VodMix,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +206,39 @@ struct ChannelRuntime {
     pending_source: Option<String>,
     monitor_loop: Loopback,
     stream_loop: Loopback,
+    vod_loop: Loopback,
+}
+
+impl ChannelRuntime {
+    fn mix_loop(&self, mix: Mix) -> &Loopback {
+        match mix {
+            Mix::Monitor => &self.monitor_loop,
+            Mix::Stream => &self.stream_loop,
+            Mix::Vod => &self.vod_loop,
+        }
+    }
+
+    fn mix_loop_mut(&mut self, mix: Mix) -> &mut Loopback {
+        match mix {
+            Mix::Monitor => &mut self.monitor_loop,
+            Mix::Stream => &mut self.stream_loop,
+            Mix::Vod => &mut self.vod_loop,
+        }
+    }
+}
+
+/// Effective volume and mute of one channel's send into a mix (the stream
+/// and VOD sends fold their master level in, since those buses have no
+/// master loopback of their own).
+fn mix_levels(c: &ChannelConfig, m: &MasterConfig, mix: Mix) -> (f64, bool) {
+    match mix {
+        Mix::Monitor => (c.monitor_volume, c.monitor_muted),
+        Mix::Stream => (
+            c.stream_volume * m.stream_volume,
+            c.stream_muted || m.stream_muted,
+        ),
+        Mix::Vod => (c.vod_volume * m.vod_volume, c.vod_muted || m.vod_muted),
+    }
 }
 
 #[derive(Default)]
@@ -220,6 +258,9 @@ struct Inner {
     default_source: Option<String>,
     /// Per-channel runtime state, keyed by the channel's stable config id.
     channels: HashMap<u64, ChannelRuntime>,
+    /// Modules making up the optional VOD bus (null sink + remap-source),
+    /// tracked separately so disabling the mix can unload exactly these.
+    vod_modules: Vec<u32>,
     /// Effect helper processes (filter chains, Carla racks).
     fx: FxManager,
     monitor_out: Loopback,
@@ -309,6 +350,7 @@ impl PulseManager {
             inner.shutting_down = false;
             inner.owned_modules.clear();
             inner.channels.clear();
+            inner.vod_modules.clear();
             inner.fx.shutdown_all();
             inner.monitor_out = Loopback::default();
             inner.monitor_out_pending = false;
@@ -369,14 +411,30 @@ impl PulseManager {
     }
 
     pub fn apply_master_stream(&self) {
-        let ids: Vec<u64> = {
-            let inner = self.inner.borrow();
-            let cfg = inner.config.borrow();
-            cfg.channels.iter().map(|c| c.id).collect()
-        };
-        for id in ids {
+        for id in self.channel_ids() {
             Self::apply_channel_mix_inner(&self.inner, id, Mix::Stream);
         }
+    }
+
+    pub fn apply_master_vod(&self) {
+        for id in self.channel_ids() {
+            Self::apply_channel_mix_inner(&self.inner, id, Mix::Vod);
+        }
+    }
+
+    fn channel_ids(&self) -> Vec<u64> {
+        let inner = self.inner.borrow();
+        let cfg = inner.config.borrow();
+        cfg.channels.iter().map(|c| c.id).collect()
+    }
+
+    /// Bring the server state in line with `config.vod_mix_enabled`: create
+    /// or tear down the VOD bus, its "Virtual VOD Mix" capture device, its
+    /// master meter and every channel's send into it — without touching the
+    /// monitor/stream wiring, so toggling the preference never interrupts
+    /// audio.
+    pub fn apply_vod_mix(&self) {
+        Self::apply_vod_mix_inner(&self.inner);
     }
 
     /// Route the monitor mix to the configured (or default) hardware sink.
@@ -739,15 +797,20 @@ impl PulseManager {
         let Some(mut intro) = Self::introspect(rc) else {
             return;
         };
-        let pending = Rc::new(Cell::new(2u8));
+        let vod = rc.borrow().config.borrow().vod_mix_enabled;
         // The buses deliberately are NOT called "Virtual … Mix": they show up
         // in speaker lists, and the name users should look for — the
         // "Virtual Stream Mix" microphone — belongs to the remap-source
         // created in `create_stream_mic`.
-        for (name, desc, icon) in [
+        let mut buses = vec![
             (MONITOR_SINK, "OpenWave Monitor Bus", "audio-headphones"),
             (STREAM_SINK, "OpenWave Stream Bus", "audio-input-microphone"),
-        ] {
+        ];
+        if vod {
+            buses.push((VOD_SINK, "OpenWave VOD Bus", "audio-input-microphone"));
+        }
+        let pending = Rc::new(Cell::new(buses.len()));
+        for (name, desc, icon) in buses {
             let args = format!(
                 "sink_name={name} sink_properties='device.description=\"{desc}\" device.icon_name={icon}'"
             );
@@ -761,7 +824,13 @@ impl PulseManager {
                     Self::fail(&rc, "Could not create the virtual mix devices.");
                     return;
                 }
-                rc.borrow_mut().owned_modules.insert(idx);
+                {
+                    let mut inner = rc.borrow_mut();
+                    inner.owned_modules.insert(idx);
+                    if name == VOD_SINK {
+                        inner.vod_modules.push(idx);
+                    }
+                }
                 pending.set(pending.get().saturating_sub(1));
                 if pending.get() == 0 {
                     Self::finish_bootstrap(&rc);
@@ -783,7 +852,11 @@ impl PulseManager {
         }
         Self::monitor_out_defer_timeout(rc);
         Self::emit(rc, AudioEvent::Ready);
-        Self::create_stream_mic(rc);
+        let vod = rc.borrow().config.borrow().vod_mix_enabled;
+        Self::create_mix_mic(rc, STREAM_SINK, STREAM_MIC, "Virtual Stream Mix");
+        if vod {
+            Self::create_mix_mic(rc, VOD_SINK, VOD_MIC, "Virtual VOD Mix");
+        }
         let ids: Vec<u64> = {
             let inner = rc.borrow();
             let cfg = inner.config.borrow();
@@ -794,21 +867,25 @@ impl PulseManager {
         }
         Self::create_peak(rc, LevelTarget::MonitorMix, &format!("{MONITOR_SINK}.monitor"));
         Self::create_peak(rc, LevelTarget::StreamMix, &format!("{STREAM_SINK}.monitor"));
+        if vod {
+            Self::create_peak(rc, LevelTarget::VodMix, &format!("{VOD_SINK}.monitor"));
+        }
         Self::schedule_refresh(rc);
     }
 
-    /// Expose the stream mix as a real capture device ("Virtual Stream Mix")
-    /// so applications that hide monitor sources — Discord, most WebRTC apps —
-    /// can select it as their microphone.
-    fn create_stream_mic(rc: &Rc<RefCell<Inner>>) {
+    /// Expose a mix bus as a real capture device ("Virtual Stream Mix" /
+    /// "Virtual VOD Mix") so applications that hide monitor sources —
+    /// Discord, most WebRTC apps — can select it as their microphone.
+    fn create_mix_mic(rc: &Rc<RefCell<Inner>>, bus: &str, source_name: &str, desc: &str) {
         let Some(mut intro) = Self::introspect(rc) else {
             return;
         };
         let args = format!(
-            "master={STREAM_SINK}.monitor source_name={STREAM_MIC} \
-             source_properties='device.description=\"Virtual Stream Mix\" device.icon_name=audio-input-microphone'"
+            "master={bus}.monitor source_name={source_name} \
+             source_properties='device.description=\"{desc}\" device.icon_name=audio-input-microphone'"
         );
         let weak = Rc::downgrade(rc);
+        let vod = source_name == VOD_MIC;
         let _ = intro.load_module("module-remap-source", &args, move |idx| {
             let Some(rc) = weak.upgrade() else {
                 return;
@@ -816,7 +893,11 @@ impl PulseManager {
             if idx == INVALID_INDEX {
                 return;
             }
-            rc.borrow_mut().owned_modules.insert(idx);
+            let mut inner = rc.borrow_mut();
+            inner.owned_modules.insert(idx);
+            if vod {
+                inner.vod_modules.push(idx);
+            }
         });
     }
 
@@ -1146,6 +1227,7 @@ impl PulseManager {
                 for l in [
                     &mut rt.monitor_loop,
                     &mut rt.stream_loop,
+                    &mut rt.vod_loop,
                     &mut rt.input_loop,
                 ] {
                     Self::match_loopback(l, &by_module, &so_by_module);
@@ -1172,18 +1254,11 @@ impl PulseManager {
                 let Some(rt) = inner.channels.get(&c.id) else {
                     continue;
                 };
-                for mix in [Mix::Monitor, Mix::Stream] {
-                    let l = match mix {
-                        Mix::Monitor => &rt.monitor_loop,
-                        Mix::Stream => &rt.stream_loop,
-                    };
-                    let (vol, mute) = match mix {
-                        Mix::Monitor => (c.monitor_volume, c.monitor_muted),
-                        Mix::Stream => (
-                            c.stream_volume * cfg.master.stream_volume,
-                            c.stream_muted || cfg.master.stream_muted,
-                        ),
-                    };
+                // The VOD loopback is a no-op default while the mix is
+                // disabled, so it can be checked unconditionally.
+                for mix in [Mix::Monitor, Mix::Stream, Mix::Vod] {
+                    let l = rt.mix_loop(mix);
+                    let (vol, mute) = mix_levels(c, &cfg.master, mix);
                     Self::check_drift(&inner, l, vol, mute, &sink_names, &source_names, &mut moves)
                         .then(|| applies.push((Some(c.id), mix)));
                 }
@@ -1262,10 +1337,7 @@ impl PulseManager {
                     let mut inner = rc.borrow_mut();
                     let l = match which {
                         LoopbackRef::Mix(id, mix) => {
-                            inner.channels.get_mut(&id).map(|rt| match mix {
-                                Mix::Monitor => &mut rt.monitor_loop,
-                                Mix::Stream => &mut rt.stream_loop,
-                            })
+                            inner.channels.get_mut(&id).map(|rt| rt.mix_loop_mut(mix))
                         }
                         LoopbackRef::Input(id) => {
                             inner.channels.get_mut(&id).map(|rt| &mut rt.input_loop)
@@ -1427,6 +1499,7 @@ impl PulseManager {
             for l in [
                 &mut rt.monitor_loop,
                 &mut rt.stream_loop,
+                &mut rt.vod_loop,
                 &mut rt.input_loop,
             ] {
                 if let Some(m) = l.module.take() {
@@ -1810,66 +1883,87 @@ impl PulseManager {
     }
 
     fn create_channel_loopbacks(rc: &Rc<RefCell<Inner>>, id: u64, generation_id: u64, source: &str) {
+        let vod = rc.borrow().config.borrow().vod_mix_enabled;
+        for mix in [Mix::Monitor, Mix::Stream] {
+            Self::create_mix_loopback(rc, id, generation_id, source, mix);
+        }
+        if vod {
+            Self::create_mix_loopback(rc, id, generation_id, source, Mix::Vod);
+        }
+    }
+
+    /// One channel's send into one mix bus.
+    fn create_mix_loopback(
+        rc: &Rc<RefCell<Inner>>,
+        id: u64,
+        generation_id: u64,
+        source: &str,
+        mix: Mix,
+    ) {
         let Some(mut intro) = Self::introspect(rc) else {
             return;
         };
-        let source_owned = source.to_string();
-        for mix in [Mix::Monitor, Mix::Stream] {
-            let sink = match mix {
-                Mix::Monitor => MONITOR_SINK,
-                Mix::Stream => STREAM_SINK,
-            };
-            let tag = format!(
-                "OpenWave ch{id} {}",
-                match mix {
-                    Mix::Monitor => "monitor",
-                    Mix::Stream => "stream",
-                }
-            );
-            let args = loopback_args(source, sink, &tag);
-            let source = source_owned.clone();
-            let weak = Rc::downgrade(rc);
-            let _ = intro.load_module("module-loopback", &args, move |idx| {
-                let Some(rc) = weak.upgrade() else {
-                    return;
-                };
-                if idx == INVALID_INDEX {
-                    return;
-                }
-                let stale = {
-                    let inner = rc.borrow();
-                    inner
-                        .channels
-                        .get(&id)
-                        .is_none_or(|rt| rt.generation != generation_id)
-                        || inner.shutting_down
-                };
-                if stale {
-                    if let Some(mut intro) = Self::introspect(&rc) {
-                        let _ = intro.unload_module(idx, |_| {});
-                    }
-                    return;
-                }
-                {
-                    let mut inner = rc.borrow_mut();
-                    inner.owned_modules.insert(idx);
-                    if let Some(rt) = inner.channels.get_mut(&id) {
-                        let l = match mix {
-                            Mix::Monitor => &mut rt.monitor_loop,
-                            Mix::Stream => &mut rt.stream_loop,
-                        };
-                        *l = Loopback {
-                            module: Some(idx),
-                            target: sink.to_string(),
-                            source_target: source.clone(),
-                            ..Loopback::default()
-                        };
-                    }
-                }
-                Self::apply_new_loopback(&rc, LoopbackRef::Mix(id, mix), idx);
-                Self::schedule_refresh(&rc);
-            });
+        let sink = match mix {
+            Mix::Monitor => MONITOR_SINK,
+            Mix::Stream => STREAM_SINK,
+            Mix::Vod => VOD_SINK,
+        };
+        let tag = format!(
+            "OpenWave ch{id} {}",
+            match mix {
+                Mix::Monitor => "monitor",
+                Mix::Stream => "stream",
+                Mix::Vod => "vod",
+            }
+        );
+        let args = loopback_args(source, sink, &tag);
+        // Mark the load as in flight (a non-empty target with no module):
+        // apply_vod_mix_inner uses this to avoid double-creating a send
+        // whose module callback has not landed yet.
+        if let Some(rt) = rc.borrow_mut().channels.get_mut(&id) {
+            rt.mix_loop_mut(mix).target = sink.to_string();
         }
+        let source = source.to_string();
+        let weak = Rc::downgrade(rc);
+        let _ = intro.load_module("module-loopback", &args, move |idx| {
+            let Some(rc) = weak.upgrade() else {
+                return;
+            };
+            if idx == INVALID_INDEX {
+                return;
+            }
+            let stale = {
+                let inner = rc.borrow();
+                inner
+                    .channels
+                    .get(&id)
+                    .is_none_or(|rt| rt.generation != generation_id)
+                    || inner.shutting_down
+                    // The VOD mix may have been disabled (and its bus
+                    // unloaded) while this load was in flight.
+                    || (mix == Mix::Vod && !inner.config.borrow().vod_mix_enabled)
+            };
+            if stale {
+                if let Some(mut intro) = Self::introspect(&rc) {
+                    let _ = intro.unload_module(idx, |_| {});
+                }
+                return;
+            }
+            {
+                let mut inner = rc.borrow_mut();
+                inner.owned_modules.insert(idx);
+                if let Some(rt) = inner.channels.get_mut(&id) {
+                    *rt.mix_loop_mut(mix) = Loopback {
+                        module: Some(idx),
+                        target: sink.to_string(),
+                        source_target: source.clone(),
+                        ..Loopback::default()
+                    };
+                }
+            }
+            Self::apply_new_loopback(&rc, LoopbackRef::Mix(id, mix), idx);
+            Self::schedule_refresh(&rc);
+        });
     }
 
     fn setup_monitor_output_inner(rc: &Rc<RefCell<Inner>>) {
@@ -1947,6 +2041,104 @@ impl PulseManager {
         });
     }
 
+    fn apply_vod_mix_inner(rc: &Rc<RefCell<Inner>>) {
+        let (usable, enabled, active) = {
+            let inner = rc.borrow();
+            (
+                inner.ready && !inner.shutting_down,
+                inner.config.borrow().vod_mix_enabled,
+                !inner.vod_modules.is_empty(),
+            )
+        };
+        // Before the bootstrap the config flag alone decides what gets
+        // created, so there is nothing to reconcile yet.
+        if !usable || enabled == active {
+            return;
+        }
+        if !enabled {
+            let to_unload = {
+                let mut inner = rc.borrow_mut();
+                let mut mods: Vec<u32> = Vec::new();
+                for rt in inner.channels.values_mut() {
+                    if let Some(m) = rt.vod_loop.module.take() {
+                        mods.push(m);
+                    }
+                    rt.vod_loop = Loopback::default();
+                }
+                mods.append(&mut inner.vod_modules);
+                for m in &mods {
+                    inner.owned_modules.remove(m);
+                }
+                if let Some(s) = inner.peaks.remove(&LevelTarget::VodMix) {
+                    Self::drop_peak(&s);
+                }
+                mods
+            };
+            Self::emit(rc, AudioEvent::Level(LevelTarget::VodMix, vec![0.0]));
+            if let Some(mut intro) = Self::introspect(rc) {
+                for m in to_unload {
+                    let _ = intro.unload_module(m, |_| {});
+                }
+            }
+            return;
+        }
+        let Some(mut intro) = Self::introspect(rc) else {
+            return;
+        };
+        let args = format!(
+            "sink_name={VOD_SINK} sink_properties='device.description=\"OpenWave VOD Bus\" device.icon_name=audio-input-microphone'"
+        );
+        let weak = Rc::downgrade(rc);
+        let _ = intro.load_module("module-null-sink", &args, move |idx| {
+            let Some(rc) = weak.upgrade() else {
+                return;
+            };
+            if idx == INVALID_INDEX {
+                return;
+            }
+            let stale = {
+                let mut inner = rc.borrow_mut();
+                let stale =
+                    inner.shutting_down || !inner.config.borrow().vod_mix_enabled;
+                if !stale {
+                    inner.owned_modules.insert(idx);
+                    inner.vod_modules.push(idx);
+                }
+                stale
+            };
+            if stale {
+                if let Some(mut intro) = Self::introspect(&rc) {
+                    let _ = intro.unload_module(idx, |_| {});
+                }
+                return;
+            }
+            Self::create_mix_mic(&rc, VOD_SINK, VOD_MIC, "Virtual VOD Mix");
+            Self::create_peak(&rc, LevelTarget::VodMix, &format!("{VOD_SINK}.monitor"));
+            // Add the VOD send to every channel that is already wired;
+            // parked/pending channels pick it up when they wire. `target` is
+            // set eagerly by create_mix_loopback, so a send whose module
+            // load is still in flight is not created twice.
+            let wired: Vec<(u64, u64, String)> = {
+                let inner = rc.borrow();
+                inner
+                    .channels
+                    .iter()
+                    .filter_map(|(&id, rt)| {
+                        let source = &rt.monitor_loop.source_target;
+                        (!source.is_empty()
+                            && rt.vod_loop.module.is_none()
+                            && rt.vod_loop.target.is_empty())
+                        .then(|| (id, rt.generation, source.clone()))
+                    })
+                    .collect()
+            };
+            for (id, generation, source) in wired {
+                Self::create_mix_loopback(&rc, id, generation, &source, Mix::Vod);
+            }
+            Self::schedule_refresh(&rc);
+        });
+    }
+
     fn apply_channel_mix_inner(rc: &Rc<RefCell<Inner>>, id: u64, mix: Mix) {
         let params = {
             let inner = rc.borrow();
@@ -1957,18 +2149,9 @@ impl PulseManager {
             let Some(rt) = inner.channels.get(&id) else {
                 return;
             };
-            let l = match mix {
-                Mix::Monitor => &rt.monitor_loop,
-                Mix::Stream => &rt.stream_loop,
-            };
+            let l = rt.mix_loop(mix);
             l.sink_input.map(|si| {
-                let (vol, mute) = match mix {
-                    Mix::Monitor => (c.monitor_volume, c.monitor_muted),
-                    Mix::Stream => (
-                        c.stream_volume * cfg.master.stream_volume,
-                        c.stream_muted || cfg.master.stream_muted,
-                    ),
-                };
+                let (vol, mute) = mix_levels(c, &cfg.master, mix);
                 (si, l.channels, vol, mute)
             })
         };
@@ -2059,6 +2242,7 @@ impl PulseManager {
                 LevelTarget::Channel(i) => format!("OpenWave meter ch{i}"),
                 LevelTarget::MonitorMix => "OpenWave meter monitor".to_string(),
                 LevelTarget::StreamMix => "OpenWave meter stream".to_string(),
+                LevelTarget::VodMix => "OpenWave meter vod".to_string(),
             };
             let mut props = Proplist::new().expect("proplist");
             let _ = props.set_str("media.name", &name);

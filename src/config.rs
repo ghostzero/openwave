@@ -97,8 +97,12 @@ pub struct ChannelConfig {
     pub assignment: Option<Assignment>,
     pub monitor_volume: f64,
     pub stream_volume: f64,
+    pub vod_volume: f64,
     pub monitor_muted: bool,
     pub stream_muted: bool,
+    pub vod_muted: bool,
+    /// Links all of the channel's faders (including the VOD fader while the
+    /// VOD mix is enabled).
     pub linked: bool,
     /// Built-in channels (Microphone, System) that cannot be removed.
     pub permanent: bool,
@@ -120,8 +124,10 @@ impl Default for ChannelConfig {
             assignment: None,
             monitor_volume: 0.75,
             stream_volume: 0.75,
+            vod_volume: 0.75,
             monitor_muted: false,
             stream_muted: false,
+            vod_muted: false,
             linked: false,
             permanent: false,
             effects: Vec::new(),
@@ -193,8 +199,10 @@ pub struct MasterConfig {
     pub monitor_device: Option<String>,
     pub monitor_volume: f64,
     pub stream_volume: f64,
+    pub vod_volume: f64,
     pub monitor_muted: bool,
     pub stream_muted: bool,
+    pub vod_muted: bool,
 }
 
 impl Default for MasterConfig {
@@ -203,8 +211,10 @@ impl Default for MasterConfig {
             monitor_device: None,
             monitor_volume: 1.0,
             stream_volume: 1.0,
+            vod_volume: 1.0,
             monitor_muted: false,
             stream_muted: false,
+            vod_muted: false,
         }
     }
 }
@@ -225,6 +235,10 @@ pub struct Config {
     pub next_channel_id: u64,
     pub channels: Vec<ChannelConfig>,
     pub master: MasterConfig,
+    /// Third mix bus exposed as the "Virtual VOD Mix" microphone, for
+    /// keeping e.g. music out of the VOD/recording track. Off by default so
+    /// the two-mix UI stays clean.
+    pub vod_mix_enabled: bool,
     /// The setup assistant was shown once; afterwards misconfigurations only
     /// produce a notice instead of the full dialog.
     pub setup_done: bool,
@@ -251,6 +265,7 @@ impl Default for Config {
                 },
             ],
             master: MasterConfig::default(),
+            vod_mix_enabled: false,
             setup_done: false,
             wave_xlr: WaveXlrConfig::default(),
         }
@@ -294,6 +309,7 @@ impl Config {
             }
             ch.monitor_volume = ch.monitor_volume.clamp(0.0, 1.0);
             ch.stream_volume = ch.stream_volume.clamp(0.0, 1.0);
+            ch.vod_volume = ch.vod_volume.clamp(0.0, 1.0);
             // Repair effect/VST ids the same way as channel ids (they share
             // one id space per channel).
             let mut seen_fx: HashSet<u64> = HashSet::new();
@@ -320,6 +336,7 @@ impl Config {
         cfg.next_channel_id = cfg.next_channel_id.max(max_id + 1);
         cfg.master.monitor_volume = cfg.master.monitor_volume.clamp(0.0, 1.0);
         cfg.master.stream_volume = cfg.master.stream_volume.clamp(0.0, 1.0);
+        cfg.master.vod_volume = cfg.master.vod_volume.clamp(0.0, 1.0);
         cfg.wave_xlr.mic_volume = cfg.wave_xlr.mic_volume.map(|v| v.clamp(0.0, 100.0));
         cfg.wave_xlr.output_volume = cfg.wave_xlr.output_volume.map(|v| v.clamp(0.0, 100.0));
         cfg
@@ -368,6 +385,11 @@ impl Config {
             id,
             name,
             assignment: Some(Assignment::Virtual),
+            // Muted towards the audience/recording until deliberately
+            // unmuted, so a fresh channel never leaks audio into the
+            // stream or VOD tracks.
+            stream_muted: true,
+            vod_muted: true,
             ..ChannelConfig::default()
         });
         Some(id)

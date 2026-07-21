@@ -9,10 +9,13 @@ use super::{label_factory, meter_pair, mute_button, MeterPair};
 
 /// Fixed width of every channel strip (and the add-channel card).
 pub const STRIP_WIDTH: i32 = 150;
+/// Wider strip while the third (VOD) fader is shown.
+const STRIP_WIDTH_VOD: i32 = 200;
 
-/// One vertical input strip: rename label, input selector, level meter and the
-/// two independent faders (monitor mix left, stream mix right) with per-mix
-/// mute buttons and an optional fader link.
+/// One vertical input strip: rename label, input selector, level meter and
+/// independent per-mix faders (monitor, stream, and — when the VOD mix is
+/// enabled — VOD) with per-mix mute buttons and a single link toggle that
+/// ties all faders together.
 pub struct ChannelStrip {
     pub root: gtk::Box,
     pub name: gtk::EditableLabel,
@@ -22,9 +25,12 @@ pub struct ChannelStrip {
     level: MeterPair,
     pub monitor_scale: gtk::Scale,
     pub stream_scale: gtk::Scale,
+    pub vod_scale: gtk::Scale,
     pub monitor_mute: gtk::ToggleButton,
     pub stream_mute: gtk::ToggleButton,
+    pub vod_mute: gtk::ToggleButton,
     pub link: gtk::ToggleButton,
+    vod_caption: gtk::Label,
     /// Set while the strip is being updated programmatically so signal
     /// handlers know not to write back into the config.
     pub guard: Rc<Cell<bool>>,
@@ -44,16 +50,20 @@ fn fader() -> gtk::Scale {
     scale
 }
 
-fn fader_column(scale: &gtk::Scale, mute: &gtk::ToggleButton, caption: &str) -> gtk::Box {
-    let col = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    col.set_hexpand(true);
-    col.append(scale);
-    col.append(mute);
-    let label = gtk::Label::new(Some(caption));
+/// One row of the fader block. Homogeneous, so every row splits the strip
+/// into equal columns and the scales, mute buttons and captions line up —
+/// also when the VOD column is hidden and the rows fall back to two columns.
+fn mix_row() -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    row.set_homogeneous(true);
+    row
+}
+
+fn caption_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
     label.add_css_class("caption");
     label.add_css_class("dim-label");
-    col.append(&label);
-    col
+    label
 }
 
 impl ChannelStrip {
@@ -107,23 +117,51 @@ impl ChannelStrip {
         monitor_scale.set_tooltip_text(Some("Monitor mix volume"));
         let stream_scale = fader();
         stream_scale.set_tooltip_text(Some("Stream mix volume"));
+        let vod_scale = fader();
+        vod_scale.set_tooltip_text(Some("VOD mix volume"));
 
         let monitor_mute = mute_button("audio-headphones-symbolic", "Mute in the monitor mix");
         let stream_mute = mute_button("media-record-symbolic", "Mute in the stream mix");
+        let vod_mute = mute_button("camera-video-symbolic", "Mute in the VOD mix");
 
         let link = gtk::ToggleButton::builder()
             .icon_name("insert-link-symbolic")
-            .tooltip_text("Link both faders")
-            .valign(gtk::Align::Center)
+            .tooltip_text("Link the faders")
+            .halign(gtk::Align::Center)
             .build();
         link.add_css_class("flat");
         link.add_css_class("circular");
 
-        let faders = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        // Fader block: a row of scales, the link toggle, a row of mute
+        // buttons and a row of captions, in equal columns so each fader's
+        // controls stack up exactly below it.
+        let scales_row = mix_row();
+        scales_row.set_vexpand(true);
+        scales_row.append(&monitor_scale);
+        scales_row.append(&stream_scale);
+        scales_row.append(&vod_scale);
+
+        let mutes_row = mix_row();
+        mutes_row.append(&monitor_mute);
+        mutes_row.append(&stream_mute);
+        mutes_row.append(&vod_mute);
+
+        let captions_row = mix_row();
+        let vod_caption = caption_label("VOD");
+        captions_row.append(&caption_label("Monitor"));
+        captions_row.append(&caption_label("Stream"));
+        captions_row.append(&vod_caption);
+
+        vod_scale.set_visible(false);
+        vod_mute.set_visible(false);
+        vod_caption.set_visible(false);
+
+        let faders = gtk::Box::new(gtk::Orientation::Vertical, 6);
         faders.set_vexpand(true);
-        faders.append(&fader_column(&monitor_scale, &monitor_mute, "Monitor"));
+        faders.append(&scales_row);
         faders.append(&link);
-        faders.append(&fader_column(&stream_scale, &stream_mute, "Stream"));
+        faders.append(&mutes_row);
+        faders.append(&captions_row);
 
         root.append(&header);
         root.append(&input);
@@ -139,9 +177,12 @@ impl ChannelStrip {
             level,
             monitor_scale,
             stream_scale,
+            vod_scale,
             monitor_mute,
             stream_mute,
+            vod_mute,
             link,
+            vod_caption,
             guard: Rc::new(Cell::new(false)),
             entries: Rc::new(RefCell::new(Vec::new())),
             last_labels: RefCell::new(Vec::new()),
@@ -161,11 +202,25 @@ impl ChannelStrip {
         self.name.set_text(&c.name);
         self.monitor_scale.set_value(c.monitor_volume);
         self.stream_scale.set_value(c.stream_volume);
+        self.vod_scale.set_value(c.vod_volume);
         self.monitor_mute.set_active(c.monitor_muted);
         self.stream_mute.set_active(c.stream_muted);
+        self.vod_mute.set_active(c.vod_muted);
         self.link.set_active(c.linked);
         self.update_fx_indicator(c);
         self.guard.set(false);
+    }
+
+    /// Show or hide the VOD fader column (and widen the strip to fit it).
+    pub fn set_vod_visible(&self, visible: bool) {
+        self.vod_scale.set_visible(visible);
+        self.vod_mute.set_visible(visible);
+        self.vod_caption.set_visible(visible);
+        self.root.set_width_request(if visible {
+            STRIP_WIDTH_VOD
+        } else {
+            STRIP_WIDTH
+        });
     }
 
     /// Tint the FX button while the channel processes through effects.
