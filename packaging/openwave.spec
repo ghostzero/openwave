@@ -19,7 +19,7 @@ BuildRequires:  alsa-lib-devel
 BuildRequires:  desktop-file-utils
 
 # The PulseAudio compatibility layer of PipeWire is the API OpenWave talks to
-Requires:       pipewire-pulse
+Requires:       pipewire-pulseaudio
 # pw-cli / pw-link, used to wire and control effect chains
 Recommends:     pipewire-utils
 # LV2 effect browser (chains still load without it)
