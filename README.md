@@ -92,10 +92,10 @@ Optional, for effects:
 
 ## Installing
 
-### Fedora (COPR) — coming soon
+### Fedora (COPR)
 
 ```sh
-sudo dnf copr enable ghostzero/openwave
+sudo dnf copr enable ghost0/openwave
 sudo dnf install openwave
 ```
 
