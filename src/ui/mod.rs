@@ -1,5 +1,7 @@
 pub mod channel_strip;
+pub mod dbus;
 pub mod effects;
+pub mod midi;
 pub mod outputs;
 pub mod setup;
 pub mod sidebar;

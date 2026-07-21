@@ -7,19 +7,44 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::audio::{AudioEvent, LevelTarget, Mix, PulseManager};
-use crate::config::{Assignment, Config, MAX_CHANNELS};
+use crate::config::{
+    Assignment, Config, MAX_CHANNELS, MidiBinding, MidiKind, MidiSource, MidiTarget,
+};
+use crate::midi::{MidiEvent, MidiManager};
 
 use super::channel_strip::ChannelStrip;
+use super::dbus;
 use super::effects::{self, EffectsDeps};
 use super::heading_label;
+use super::midi as midi_ui;
 use super::outputs::OutputsPanel;
 use super::setup;
 use super::sidebar::Sidebar;
 use super::wave_xlr;
 
+/// An armed "Learn MIDI" dialog waiting for the next hardware event.
+struct LearnRequest {
+    target: MidiTarget,
+    /// Profile the binding is stored in (the active one when armed).
+    profile: u64,
+    /// Closes the dialog and reports what was captured.
+    done: Box<dyn Fn(MidiSource)>,
+}
+
+/// Runtime fader-pickup / edge-detection state per bound hardware control.
+/// Never persisted; cleared on profile switches and binding edits.
+struct PickupState {
+    engaged: bool,
+    /// Previous incoming value (0..1); -1 before the first event.
+    last_in: f64,
+    /// Target value as of our last write, to detect outside changes.
+    last_written: f64,
+}
+
 struct App {
     config: Rc<RefCell<Config>>,
     manager: PulseManager,
+    midi: MidiManager,
     window: glib::WeakRef<adw::ApplicationWindow>,
     toasts: adw::ToastOverlay,
     /// Channel strips currently shown, each paired with its channel id.
@@ -50,6 +75,15 @@ struct App {
     xlr_out_hold: Cell<Option<Instant>>,
     /// Forces every strip and the add-channel card to the same width.
     strip_size_group: gtk::SizeGroup,
+    midi_learn: RefCell<Option<LearnRequest>>,
+    midi_pickup: RefCell<HashMap<MidiSource, PickupState>>,
+    /// Last velocity sent per (device, MIDI channel, note), so LED feedback
+    /// only transmits actual changes.
+    midi_led: RefCell<HashMap<(String, u8, u8), u8>>,
+    /// Refresh hook of the open MIDI controllers dialog.
+    midi_hook: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Emits the D-Bus StateChanged signal (None when off the session bus).
+    dbus_signal: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
@@ -149,6 +183,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let menu_settings = gio::Menu::new();
     menu_settings.append(Some("Audio Setup…"), Some("win.setup"));
     menu_settings.append(Some("Wave XLR…"), Some("win.wave-xlr"));
+    menu_settings.append(Some("MIDI Controllers…"), Some("win.midi"));
     menu_settings.append(Some("Enable VOD Mix"), Some("win.vod-mix"));
     menu_settings.append(Some("Start at Login"), Some("win.autostart"));
     menu.append_section(None, &menu_settings);
@@ -201,6 +236,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let app = Rc::new(App {
         config,
         manager,
+        midi: MidiManager::new(),
         window: window.downgrade(),
         toasts,
         strips: RefCell::new(Vec::new()),
@@ -219,11 +255,31 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
         xlr_mic_hold: Cell::new(None),
         xlr_out_hold: Cell::new(None),
         strip_size_group,
+        midi_learn: RefCell::new(None),
+        midi_pickup: RefCell::new(HashMap::new()),
+        midi_led: RefCell::new(HashMap::new()),
+        midi_hook: RefCell::new(None),
+        dbus_signal: RefCell::new(None),
     });
 
     wire_actions(&app, &window);
     wire_outputs(&app);
     wire_audio_events(&app);
+    wire_midi_events(&app);
+    app.midi.start();
+    {
+        let perform_action: Rc<dyn Fn(ControlAction)> = {
+            let app = app.clone();
+            Rc::new(move |action| perform(&app, action))
+        };
+        *app.dbus_signal.borrow_mut() = dbus::register(
+            application,
+            dbus::DbusDeps {
+                config: app.config.clone(),
+                perform: perform_action,
+            },
+        );
+    }
     {
         let app = app.clone();
         retry.connect_clicked(move |_| {
@@ -261,6 +317,12 @@ fn schedule_save(app: &Rc<App>) {
     glib::timeout_add_local_once(Duration::from_millis(700), move || {
         app.save_pending.set(false);
         app.config.borrow().save();
+        // Every state mutation funnels through here, so this doubles as the
+        // (coalesced) D-Bus change notification.
+        let signal = app.dbus_signal.borrow().clone();
+        if let Some(signal) = signal {
+            signal();
+        }
     });
 }
 
@@ -275,6 +337,7 @@ fn wire_audio_events(app: &Rc<App>) {
         match ev {
             AudioEvent::Ready => {
                 app.stack.set_visible_child_name("mixer");
+                refresh_leds(&app);
                 // Give the buses/loopbacks a moment to settle before judging
                 // the setup, so startup churn doesn't read as misconfigured.
                 let app = app.clone();
@@ -330,6 +393,517 @@ fn wire_audio_events(app: &Rc<App>) {
                 }
             }
         }
+    });
+}
+
+// ---- Control core -----------------------------------------------------------
+
+/// One mixer mutation, shared by MIDI dispatch and the D-Bus API (and any
+/// future remote-control surface). Actions drive the same widgets the user
+/// would, so the existing signal handlers do the config write, server
+/// apply, link-follow and debounced save — one code path for everything.
+#[derive(Clone, Copy, Debug)]
+pub enum ControlAction {
+    SetChannelVolume { id: u64, mix: Mix, value: f64 },
+    /// `muted: None` toggles.
+    SetChannelMute { id: u64, mix: Mix, muted: Option<bool> },
+    SetMasterVolume { mix: Mix, value: f64 },
+    SetMasterMute { mix: Mix, muted: Option<bool> },
+    SelectMidiProfile { id: u64 },
+}
+
+/// The per-mix widgets of a channel strip, cloned out so no `strips` borrow
+/// is held while a `set_value`/`set_active` runs its handlers.
+fn channel_widgets(app: &App, id: u64, mix: Mix) -> Option<(gtk::Scale, gtk::ToggleButton)> {
+    let strips = app.strips.borrow();
+    let (_, strip) = strips.iter().find(|(cid, _)| *cid == id)?;
+    Some(match mix {
+        Mix::Monitor => (strip.monitor_scale.clone(), strip.monitor_mute.clone()),
+        Mix::Stream => (strip.stream_scale.clone(), strip.stream_mute.clone()),
+        Mix::Vod => (strip.vod_scale.clone(), strip.vod_mute.clone()),
+    })
+}
+
+fn perform(app: &Rc<App>, action: ControlAction) {
+    // VOD targets are inert while the VOD mix is disabled.
+    let vod_off = |mix: Mix| mix == Mix::Vod && !app.config.borrow().vod_mix_enabled;
+    match action {
+        ControlAction::SetChannelVolume { id, mix, value } => {
+            if vod_off(mix) {
+                return;
+            }
+            let Some((scale, _)) = channel_widgets(app, id, mix) else {
+                return;
+            };
+            scale.set_value(value.clamp(0.0, 1.0));
+        }
+        ControlAction::SetChannelMute { id, mix, muted } => {
+            if vod_off(mix) {
+                return;
+            }
+            let Some((_, mute)) = channel_widgets(app, id, mix) else {
+                return;
+            };
+            mute.set_active(muted.unwrap_or(!mute.is_active()));
+        }
+        ControlAction::SetMasterVolume { mix, value } => {
+            if vod_off(mix) {
+                return;
+            }
+            let scale = match mix {
+                Mix::Monitor => app.outputs.monitor_scale.clone(),
+                Mix::Stream => app.outputs.stream_scale.clone(),
+                Mix::Vod => app.outputs.vod_scale.clone(),
+            };
+            scale.set_value(value.clamp(0.0, 1.0));
+        }
+        ControlAction::SetMasterMute { mix, muted } => {
+            if vod_off(mix) {
+                return;
+            }
+            let mute = match mix {
+                Mix::Monitor => app.outputs.monitor_mute.clone(),
+                Mix::Stream => app.outputs.stream_mute.clone(),
+                Mix::Vod => app.outputs.vod_mute.clone(),
+            };
+            mute.set_active(muted.unwrap_or(!mute.is_active()));
+        }
+        ControlAction::SelectMidiProfile { id } => {
+            {
+                let mut cfg = app.config.borrow_mut();
+                if cfg.midi.profile(id).is_none() || cfg.midi.active_profile == id {
+                    return;
+                }
+                cfg.midi.active_profile = id;
+            }
+            // Faders bound in the new profile must pick up their targets.
+            app.midi_pickup.borrow_mut().clear();
+            schedule_save(app);
+            refresh_leds(app);
+            let hook = app.midi_hook.borrow().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+            let name = app
+                .config
+                .borrow()
+                .midi
+                .profile(id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            app.toasts
+                .add_toast(adw::Toast::new(&format!("MIDI profile: {name}")));
+        }
+    }
+}
+
+// ---- MIDI dispatch ----------------------------------------------------------
+
+fn wire_midi_events(app: &Rc<App>) {
+    let weak = Rc::downgrade(app);
+    app.midi.set_event_handler(move |ev| {
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+        match ev {
+            MidiEvent::DevicesChanged => {
+                // Forget what a replugged controller was showing so its
+                // pads are fully re-sent, then update LEDs and the dialog.
+                let devices = app.midi.devices();
+                app.midi_led
+                    .borrow_mut()
+                    .retain(|key, _| devices.contains(&key.0));
+                refresh_leds(&app);
+                let hook = app.midi_hook.borrow().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            MidiEvent::Control {
+                device,
+                channel,
+                number,
+                value,
+            } => handle_midi_input(
+                &app,
+                MidiSource {
+                    device,
+                    channel,
+                    kind: MidiKind::Cc,
+                    number,
+                },
+                value,
+            ),
+            MidiEvent::NoteOn {
+                device,
+                channel,
+                number,
+                ..
+            } => handle_midi_input(
+                &app,
+                MidiSource {
+                    device,
+                    channel,
+                    kind: MidiKind::Note,
+                    number,
+                },
+                127,
+            ),
+        }
+    });
+}
+
+fn handle_midi_input(app: &Rc<App>, source: MidiSource, value: u8) {
+    if app.midi_learn.borrow().is_some() {
+        learn_capture(app, source);
+        return;
+    }
+    let target = {
+        let cfg = app.config.borrow();
+        cfg.midi
+            .global_bindings
+            .iter()
+            .chain(cfg.midi.active().bindings.iter())
+            .find(|b| b.source == source)
+            .map(|b| b.target)
+    };
+    let Some(target) = target else {
+        return;
+    };
+    match target {
+        MidiTarget::ChannelVolume { id, mix } => {
+            if let Some(v) = fader_value(app, &source, value, &target) {
+                perform(app, ControlAction::SetChannelVolume { id, mix, value: v });
+            }
+        }
+        MidiTarget::MasterVolume { mix } => {
+            if let Some(v) = fader_value(app, &source, value, &target) {
+                perform(app, ControlAction::SetMasterVolume { mix, value: v });
+            }
+        }
+        MidiTarget::ChannelMute { id, mix } => {
+            if pressed(app, &source, value) {
+                perform(app, ControlAction::SetChannelMute { id, mix, muted: None });
+            }
+        }
+        MidiTarget::MasterMute { mix } => {
+            if pressed(app, &source, value) {
+                perform(app, ControlAction::SetMasterMute { mix, muted: None });
+            }
+        }
+        MidiTarget::SelectProfile { profile } => {
+            if pressed(app, &source, value) {
+                perform(app, ControlAction::SelectMidiProfile { id: profile });
+            }
+        }
+    }
+}
+
+/// Map a CC event onto a volume target, applying fader pickup. Returns the
+/// value to apply, or None while the event should be swallowed.
+fn fader_value(app: &Rc<App>, source: &MidiSource, value: u8, target: &MidiTarget) -> Option<f64> {
+    if source.kind != MidiKind::Cc {
+        return None;
+    }
+    let v = value as f64 / 127.0;
+    let cur = {
+        let cfg = app.config.borrow();
+        match *target {
+            MidiTarget::ChannelVolume { id, mix } => {
+                let c = cfg.channel(id)?;
+                match mix {
+                    Mix::Monitor => c.monitor_volume,
+                    Mix::Stream => c.stream_volume,
+                    Mix::Vod => c.vod_volume,
+                }
+            }
+            MidiTarget::MasterVolume { mix } => match mix {
+                Mix::Monitor => cfg.master.monitor_volume,
+                Mix::Stream => cfg.master.stream_volume,
+                Mix::Vod => cfg.master.vod_volume,
+            },
+            _ => return None,
+        }
+    };
+    pickup_allows(app, source, v, cur).then_some(v)
+}
+
+/// Fader pickup: a hardware fader that is out of sync with its target
+/// (profile switch, GUI drag, link-follow) must cross the current value
+/// once before it takes over, so it never jumps the volume to wherever the
+/// fader happens to sit.
+fn pickup_allows(app: &Rc<App>, source: &MidiSource, v: f64, cur: f64) -> bool {
+    if !app.config.borrow().midi.pickup {
+        return true;
+    }
+    let mut map = app.midi_pickup.borrow_mut();
+    let st = map.entry(source.clone()).or_insert(PickupState {
+        engaged: false,
+        last_in: -1.0,
+        last_written: f64::NAN,
+    });
+    // Something else moved the target since our last write: back to pickup
+    // until the fader catches the new value.
+    if st.engaged && (cur - st.last_written).abs() > 0.02 {
+        st.engaged = false;
+    }
+    if !st.engaged
+        && ((v - cur).abs() <= 0.03
+            || (st.last_in >= 0.0 && (st.last_in - cur) * (v - cur) <= 0.0))
+    {
+        st.engaged = true;
+    }
+    st.last_in = v;
+    if st.engaged {
+        st.last_written = v;
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether this event counts as a button press. Notes always do (note-offs
+/// never reach this layer); CC buttons act once per rising edge through the
+/// midpoint, so momentary pads sending 127/0 toggle cleanly and a swept
+/// knob toggles only once.
+fn pressed(app: &Rc<App>, source: &MidiSource, value: u8) -> bool {
+    if source.kind == MidiKind::Note {
+        return true;
+    }
+    let mut map = app.midi_pickup.borrow_mut();
+    let st = map.entry(source.clone()).or_insert(PickupState {
+        engaged: false,
+        last_in: -1.0,
+        last_written: f64::NAN,
+    });
+    let v = value as f64 / 127.0;
+    let was_low = st.last_in < 0.5;
+    st.last_in = v;
+    v >= 0.5 && was_low
+}
+
+fn learn_capture(app: &Rc<App>, source: MidiSource) {
+    {
+        // Volume targets need a continuous control; ignore pad presses
+        // while one is being learned instead of mis-binding them.
+        let learn = app.midi_learn.borrow();
+        let Some(req) = learn.as_ref() else {
+            return;
+        };
+        let volume = matches!(
+            req.target,
+            MidiTarget::ChannelVolume { .. } | MidiTarget::MasterVolume { .. }
+        );
+        if volume && source.kind == MidiKind::Note {
+            return;
+        }
+    }
+    let Some(req) = app.midi_learn.borrow_mut().take() else {
+        return;
+    };
+    app.config.borrow_mut().midi.bind(
+        req.profile,
+        MidiBinding {
+            source: source.clone(),
+            target: req.target,
+        },
+    );
+    app.midi_pickup.borrow_mut().clear();
+    schedule_save(app);
+    refresh_leds(app);
+    let hook = app.midi_hook.borrow().clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+    (req.done)(source);
+}
+
+// ---- MIDI LED feedback ------------------------------------------------------
+
+/// Push mute / active-profile state to note-bound pads, transmitting only
+/// actual changes. Pads whose binding disappeared (or all of them, when LED
+/// feedback is off) are blanked.
+fn refresh_leds(app: &Rc<App>) {
+    let (desired, off) = {
+        let cfg = app.config.borrow();
+        let mut desired: HashMap<(String, u8, u8), u8> = HashMap::new();
+        if cfg.midi.led_feedback {
+            let (on, off) = (cfg.midi.on_velocity, cfg.midi.off_velocity);
+            for b in cfg
+                .midi
+                .global_bindings
+                .iter()
+                .chain(cfg.midi.active().bindings.iter())
+            {
+                if b.source.kind != MidiKind::Note {
+                    continue;
+                }
+                let lit = match b.target {
+                    MidiTarget::ChannelMute { id, mix } => {
+                        if mix == Mix::Vod && !cfg.vod_mix_enabled {
+                            continue;
+                        }
+                        let Some(c) = cfg.channel(id) else {
+                            continue;
+                        };
+                        match mix {
+                            Mix::Monitor => c.monitor_muted,
+                            Mix::Stream => c.stream_muted,
+                            Mix::Vod => c.vod_muted,
+                        }
+                    }
+                    MidiTarget::MasterMute { mix } => {
+                        if mix == Mix::Vod && !cfg.vod_mix_enabled {
+                            continue;
+                        }
+                        match mix {
+                            Mix::Monitor => cfg.master.monitor_muted,
+                            Mix::Stream => cfg.master.stream_muted,
+                            Mix::Vod => cfg.master.vod_muted,
+                        }
+                    }
+                    MidiTarget::SelectProfile { profile } => profile == cfg.midi.active_profile,
+                    _ => continue,
+                };
+                desired.insert(
+                    (b.source.device.clone(), b.source.channel, b.source.number),
+                    if lit { on } else { off },
+                );
+            }
+        }
+        (desired, cfg.midi.off_velocity)
+    };
+    let mut cache = app.midi_led.borrow_mut();
+    let stale: Vec<(String, u8, u8)> = cache
+        .keys()
+        .filter(|k| !desired.contains_key(*k))
+        .cloned()
+        .collect();
+    for key in stale {
+        app.midi.send_note(&key.0, key.1, key.2, off);
+        cache.remove(&key);
+    }
+    for (key, vel) in desired {
+        if cache.get(&key) == Some(&vel) {
+            continue;
+        }
+        app.midi.send_note(&key.0, key.1, key.2, vel);
+        cache.insert(key, vel);
+    }
+}
+
+// ---- MIDI learn UI ----------------------------------------------------------
+
+/// Right-clicking a fader or mute opens the MIDI learn dialog for it.
+fn attach_learn(app: &Rc<App>, widget: &impl IsA<gtk::Widget>, target: MidiTarget) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+    let app = app.clone();
+    gesture.connect_pressed(move |_, _, _, _| open_learn_dialog(&app, target));
+    widget.add_controller(gesture);
+}
+
+fn open_learn_dialog(app: &Rc<App>, target: MidiTarget) {
+    let Some(window) = app.window.upgrade() else {
+        return;
+    };
+    if !app.midi.available() {
+        app.toasts.add_toast(adw::Toast::new(
+            "MIDI is unavailable — the ALSA sequencer could not be opened",
+        ));
+        return;
+    }
+    let (profile, desc, bound) = {
+        let cfg = app.config.borrow();
+        let bindings = if matches!(target, MidiTarget::SelectProfile { .. }) {
+            &cfg.midi.global_bindings
+        } else {
+            &cfg.midi.active().bindings
+        };
+        (
+            cfg.midi.active_profile,
+            midi_ui::target_description(&cfg, &target),
+            bindings.iter().any(|b| b.target == target),
+        )
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading("Learn MIDI Control")
+        .body(format!(
+            "Move a fader or press a pad on your MIDI controller to bind it to {desc}."
+        ))
+        .default_response("cancel")
+        .close_response("cancel")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel")]);
+    if bound {
+        dialog.add_responses(&[("clear", "Remove Binding")]);
+        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+    }
+    {
+        let toasts = app.toasts.clone();
+        let dlg = dialog.clone();
+        *app.midi_learn.borrow_mut() = Some(LearnRequest {
+            target,
+            profile,
+            done: Box::new(move |source| {
+                toasts.add_toast(adw::Toast::new(&format!("Bound to {}", source.label())));
+                dlg.close();
+            }),
+        });
+    }
+    {
+        let app = app.clone();
+        dialog.connect_response(Some("clear"), move |_, _| {
+            app.config.borrow_mut().midi.unbind(profile, &target);
+            schedule_save(&app);
+            refresh_leds(&app);
+            let hook = app.midi_hook.borrow().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        dialog.connect_closed(move |_| {
+            *app.midi_learn.borrow_mut() = None;
+        });
+    }
+    dialog.present(Some(&window));
+}
+
+fn open_midi_dialog(app: &Rc<App>) {
+    if app.midi_hook.borrow().is_some() {
+        return;
+    }
+    let Some(window) = app.window.upgrade() else {
+        return;
+    };
+    let on_changed: Rc<dyn Fn()> = {
+        let app = app.clone();
+        Rc::new(move || {
+            app.midi_pickup.borrow_mut().clear();
+            schedule_save(&app);
+            refresh_leds(&app);
+        })
+    };
+    let start_learn: Rc<dyn Fn(MidiTarget)> = {
+        let app = app.clone();
+        Rc::new(move |target| open_learn_dialog(&app, target))
+    };
+    let (dialog, refresh) = midi_ui::open(
+        &window,
+        midi_ui::MidiDeps {
+            config: app.config.clone(),
+            midi: app.midi.clone(),
+            on_changed,
+            start_learn,
+        },
+    );
+    *app.midi_hook.borrow_mut() = Some(refresh);
+    let app = app.clone();
+    dialog.connect_closed(move |_| {
+        *app.midi_hook.borrow_mut() = None;
     });
 }
 
@@ -453,6 +1027,14 @@ fn rebuild_add_menu(app: &Rc<App>) {
 }
 
 fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
+    // Right-click on any fader or mute binds a MIDI control to it.
+    attach_learn(app, &strip.monitor_scale, MidiTarget::ChannelVolume { id, mix: Mix::Monitor });
+    attach_learn(app, &strip.stream_scale, MidiTarget::ChannelVolume { id, mix: Mix::Stream });
+    attach_learn(app, &strip.vod_scale, MidiTarget::ChannelVolume { id, mix: Mix::Vod });
+    attach_learn(app, &strip.monitor_mute, MidiTarget::ChannelMute { id, mix: Mix::Monitor });
+    attach_learn(app, &strip.stream_mute, MidiTarget::ChannelMute { id, mix: Mix::Stream });
+    attach_learn(app, &strip.vod_mute, MidiTarget::ChannelMute { id, mix: Mix::Vod });
+
     {
         let app = app.clone();
         let guard = strip.guard.clone();
@@ -621,6 +1203,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             }
             app.manager.apply_channel_mix(id, Mix::Monitor);
             schedule_save(&app);
+            refresh_leds(&app);
         });
     }
 
@@ -640,6 +1223,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             }
             app.manager.apply_channel_mix(id, Mix::Stream);
             schedule_save(&app);
+            refresh_leds(&app);
         });
     }
 
@@ -659,6 +1243,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             }
             app.manager.apply_channel_mix(id, Mix::Vod);
             schedule_save(&app);
+            refresh_leds(&app);
         });
     }
 
@@ -752,11 +1337,16 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             confirm.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
             let app = app.clone();
             confirm.connect_response(Some("remove"), move |_, _| {
-                app.config.borrow_mut().remove_channel(id);
+                {
+                    let mut cfg = app.config.borrow_mut();
+                    cfg.remove_channel(id);
+                    cfg.midi.remove_channel_bindings(id);
+                }
                 app.manager.rebuild_channel(id);
                 rebuild_strips(&app);
                 schedule_save(&app);
                 update_sidebar(&app);
+                refresh_leds(&app);
             });
             confirm.present(Some(btn));
         });
@@ -766,6 +1356,13 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
 // ---- Outputs section -----------------------------------------------------------
 
 fn wire_outputs(app: &Rc<App>) {
+    attach_learn(app, &app.outputs.monitor_scale, MidiTarget::MasterVolume { mix: Mix::Monitor });
+    attach_learn(app, &app.outputs.stream_scale, MidiTarget::MasterVolume { mix: Mix::Stream });
+    attach_learn(app, &app.outputs.vod_scale, MidiTarget::MasterVolume { mix: Mix::Vod });
+    attach_learn(app, &app.outputs.monitor_mute, MidiTarget::MasterMute { mix: Mix::Monitor });
+    attach_learn(app, &app.outputs.stream_mute, MidiTarget::MasterMute { mix: Mix::Stream });
+    attach_learn(app, &app.outputs.vod_mute, MidiTarget::MasterMute { mix: Mix::Vod });
+
     {
         let app = app.clone();
         app.clone()
@@ -820,6 +1417,7 @@ fn wire_outputs(app: &Rc<App>) {
                 app.config.borrow_mut().master.monitor_muted = btn.is_active();
                 app.manager.apply_master_monitor();
                 schedule_save(&app);
+                refresh_leds(&app);
             });
     }
     {
@@ -845,6 +1443,7 @@ fn wire_outputs(app: &Rc<App>) {
             app.config.borrow_mut().master.stream_muted = btn.is_active();
             app.manager.apply_master_stream();
             schedule_save(&app);
+            refresh_leds(&app);
         });
     }
     {
@@ -870,6 +1469,7 @@ fn wire_outputs(app: &Rc<App>) {
             app.config.borrow_mut().master.vod_muted = btn.is_active();
             app.manager.apply_master_vod();
             schedule_save(&app);
+            refresh_leds(&app);
         });
     }
 }
@@ -1121,9 +1721,17 @@ fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
             }
             schedule_save(&app);
             update_sidebar(&app);
+            refresh_leds(&app);
         });
     }
     window.add_action(&vod);
+
+    let midi_action = gio::SimpleAction::new("midi", None);
+    {
+        let app = app.clone();
+        midi_action.connect_activate(move |_, _| open_midi_dialog(&app));
+    }
+    window.add_action(&midi_action);
 
     let setup_action = gio::SimpleAction::new("setup", None);
     {
@@ -1194,6 +1802,12 @@ fn wire_quit(app: &Rc<App>, application: &adw::Application, window: &adw::Applic
     let window = window.clone();
     quit.connect_activate(move |_, _| {
         app.config.borrow().save();
+        // Leave controller pads dark instead of frozen at the last state.
+        let lit: Vec<(String, u8, u8)> = app.midi_led.borrow_mut().drain().map(|(k, _)| k).collect();
+        let off = app.config.borrow().midi.off_velocity;
+        for (device, channel, note) in lit {
+            app.midi.send_note(&device, channel, note, off);
+        }
         let done = Rc::new(Cell::new(false));
         let finish = {
             let application = application.clone();

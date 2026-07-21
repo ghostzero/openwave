@@ -2,11 +2,11 @@
 pkgname=openwave
 pkgver=0.5.0
 pkgrel=1
-pkgdesc="Dual-mix virtual audio mixer for PipeWire, inspired by Elgato Wave Link"
+pkgdesc="Dual-mix virtual audio mixer for PipeWire"
 arch=('x86_64' 'aarch64')
 url="https://github.com/ghostzero/openwave"
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'libpulse' 'pipewire-pulse' 'hicolor-icon-theme')
+depends=('gtk4' 'libadwaita' 'libpulse' 'alsa-lib' 'pipewire-pulse' 'hicolor-icon-theme')
 makedepends=('cargo')
 checkdepends=('desktop-file-utils')
 optdepends=('lilv: LV2 effect plugin browser'

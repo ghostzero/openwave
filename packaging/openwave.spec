@@ -14,6 +14,8 @@ BuildRequires:  gcc
 BuildRequires:  gtk4-devel >= 4.18
 BuildRequires:  libadwaita-devel >= 1.8
 BuildRequires:  pulseaudio-libs-devel
+# MIDI controller support (ALSA sequencer)
+BuildRequires:  alsa-lib-devel
 BuildRequires:  desktop-file-utils
 
 # The PulseAudio compatibility layer of PipeWire is the API OpenWave talks to
@@ -26,12 +28,13 @@ Recommends:     lilv
 Suggests:       Carla
 
 %description
-OpenWave is a dual-mix virtual audio mixer for Linux, inspired by Elgato
-Wave Link. Every input channel has two independent faders: a Monitor Mix
-(what you hear) and a Stream Mix, exposed as a virtual microphone
-"Virtual Stream Mix" for OBS, Discord, or any other application. Channels
-can capture microphones, application playback streams, or act as virtual
-output devices, with optional per-channel LV2 and VST2/VST3 effect chains.
+OpenWave is a dual-mix virtual audio mixer for Linux. Every input channel
+has two independent faders: a Monitor Mix (what you hear) and a Stream
+Mix, exposed as a virtual microphone "Virtual Stream Mix" for OBS,
+Discord, or any other application. Channels can capture microphones,
+application playback streams, or act as virtual output devices, with
+optional per-channel LV2 and VST2/VST3 effect chains, MIDI controller
+support with MIDI learn, and a D-Bus control API for scripting.
 
 %prep
 %autosetup

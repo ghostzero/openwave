@@ -229,6 +229,188 @@ pub struct WaveXlrConfig {
     pub output_volume: Option<f64>,
 }
 
+/// What kind of MIDI message a binding listens for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MidiKind {
+    Cc,
+    Note,
+}
+
+/// One physical control, identified by controller name (the USB product
+/// string — stable across replugs, unlike sequencer client ids) plus the
+/// message's MIDI channel and CC/note number.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MidiSource {
+    pub device: String,
+    pub channel: u8,
+    pub kind: MidiKind,
+    pub number: u8,
+}
+
+impl MidiSource {
+    /// Short human-readable form, e.g. "CC 48 · APC MINI mk2".
+    pub fn label(&self) -> String {
+        let what = match self.kind {
+            MidiKind::Cc => "CC",
+            MidiKind::Note => "Note",
+        };
+        format!("{what} {} · {}", self.number, self.device)
+    }
+}
+
+/// What a bound control drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum MidiTarget {
+    ChannelVolume { id: u64, mix: crate::audio::Mix },
+    ChannelMute { id: u64, mix: crate::audio::Mix },
+    MasterVolume { mix: crate::audio::Mix },
+    MasterMute { mix: crate::audio::Mix },
+    /// Switches the active binding profile (by stable profile id). Stored
+    /// in `MidiConfig::global_bindings` so profile pads work everywhere.
+    SelectProfile { profile: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MidiBinding {
+    pub source: MidiSource,
+    pub target: MidiTarget,
+}
+
+/// A bank of bindings; pads bound to `SelectProfile` switch between them
+/// (e.g. one profile per mix layer, or one per channel).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MidiProfile {
+    /// Stable identifier; never reused, survives deletion of other profiles.
+    pub id: u64,
+    pub name: String,
+    pub bindings: Vec<MidiBinding>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MidiConfig {
+    /// Fader pickup: after a profile switch a hardware fader only takes
+    /// effect once it crosses the target's current value, instead of
+    /// jumping the volume to wherever the fader happens to sit.
+    pub pickup: bool,
+    pub next_profile_id: u64,
+    pub profiles: Vec<MidiProfile>,
+    /// Id of the profile whose bindings are live; persisted so a restart
+    /// comes back in the same bank.
+    pub active_profile: u64,
+    /// Profile-select pads, active regardless of the current profile.
+    pub global_bindings: Vec<MidiBinding>,
+    /// Light up note-bound pads (mute state, active profile) by sending
+    /// note-ons back to the controller.
+    pub led_feedback: bool,
+    /// Velocity sent for a lit pad; selects the color on e.g. an APC mini.
+    pub on_velocity: u8,
+    /// Velocity sent for a dark pad.
+    pub off_velocity: u8,
+}
+
+impl Default for MidiConfig {
+    fn default() -> Self {
+        Self {
+            pickup: true,
+            next_profile_id: 2,
+            profiles: vec![MidiProfile {
+                id: 1,
+                name: "Default".to_string(),
+                ..MidiProfile::default()
+            }],
+            active_profile: 1,
+            global_bindings: Vec::new(),
+            led_feedback: true,
+            on_velocity: 127,
+            off_velocity: 0,
+        }
+    }
+}
+
+impl MidiConfig {
+    pub fn active(&self) -> &MidiProfile {
+        self.profiles
+            .iter()
+            .find(|p| p.id == self.active_profile)
+            .unwrap_or(&self.profiles[0])
+    }
+
+    pub fn profile(&self, id: u64) -> Option<&MidiProfile> {
+        self.profiles.iter().find(|p| p.id == id)
+    }
+
+    pub fn add_profile(&mut self) -> u64 {
+        let id = self.next_profile_id;
+        self.next_profile_id += 1;
+        self.profiles.push(MidiProfile {
+            id,
+            name: format!("Profile {id}"),
+            ..MidiProfile::default()
+        });
+        id
+    }
+
+    /// Remove a profile plus every pad bound to it; keeps at least one
+    /// profile and repairs `active_profile` if it pointed at the removed one.
+    pub fn remove_profile(&mut self, id: u64) {
+        if self.profiles.len() <= 1 {
+            return;
+        }
+        self.profiles.retain(|p| p.id != id);
+        self.global_bindings
+            .retain(|b| !matches!(b.target, MidiTarget::SelectProfile { profile } if profile == id));
+        if self.profile(self.active_profile).is_none() {
+            self.active_profile = self.profiles[0].id;
+        }
+    }
+
+    /// Store a binding in the given profile (or in the global list for
+    /// `SelectProfile` targets), evicting any binding there that already
+    /// uses the same physical control or the same target — one control per
+    /// target, one target per control.
+    pub fn bind(&mut self, profile_id: u64, binding: MidiBinding) {
+        let list = if matches!(binding.target, MidiTarget::SelectProfile { .. }) {
+            &mut self.global_bindings
+        } else {
+            let Some(p) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
+                return;
+            };
+            &mut p.bindings
+        };
+        list.retain(|b| b.source != binding.source && b.target != binding.target);
+        list.push(binding);
+    }
+
+    /// Remove the binding for a target from the given profile (globals for
+    /// `SelectProfile` targets).
+    pub fn unbind(&mut self, profile_id: u64, target: &MidiTarget) {
+        if matches!(target, MidiTarget::SelectProfile { .. }) {
+            self.global_bindings.retain(|b| b.target != *target);
+        } else if let Some(p) = self.profiles.iter_mut().find(|p| p.id == profile_id) {
+            p.bindings.retain(|b| b.target != *target);
+        }
+    }
+
+    /// Drop every binding that references a removed channel.
+    pub fn remove_channel_bindings(&mut self, channel_id: u64) {
+        let refers = |t: &MidiTarget| {
+            matches!(
+                t,
+                MidiTarget::ChannelVolume { id, .. } | MidiTarget::ChannelMute { id, .. }
+                    if *id == channel_id
+            )
+        };
+        for p in &mut self.profiles {
+            p.bindings.retain(|b| !refers(&b.target));
+        }
+        self.global_bindings.retain(|b| !refers(&b.target));
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -243,6 +425,7 @@ pub struct Config {
     /// produce a notice instead of the full dialog.
     pub setup_done: bool,
     pub wave_xlr: WaveXlrConfig,
+    pub midi: MidiConfig,
 }
 
 impl Default for Config {
@@ -268,6 +451,7 @@ impl Default for Config {
             vod_mix_enabled: false,
             setup_done: false,
             wave_xlr: WaveXlrConfig::default(),
+            midi: MidiConfig::default(),
         }
     }
 }
@@ -339,6 +523,42 @@ impl Config {
         cfg.master.vod_volume = cfg.master.vod_volume.clamp(0.0, 1.0);
         cfg.wave_xlr.mic_volume = cfg.wave_xlr.mic_volume.map(|v| v.clamp(0.0, 100.0));
         cfg.wave_xlr.output_volume = cfg.wave_xlr.output_volume.map(|v| v.clamp(0.0, 100.0));
+
+        // MIDI: repair profile ids the same way as channel ids, then drop
+        // bindings that reference channels or profiles that no longer exist
+        // (hand-edited configs, channels removed by older builds).
+        if cfg.midi.profiles.is_empty() {
+            cfg.midi.profiles = MidiConfig::default().profiles;
+        }
+        let mut seen_p: HashSet<u64> = HashSet::new();
+        let mut max_p = 0;
+        for p in &mut cfg.midi.profiles {
+            if p.id == 0 || seen_p.contains(&p.id) {
+                p.id = cfg.midi.next_profile_id.max(max_p + 1);
+            }
+            seen_p.insert(p.id);
+            max_p = max_p.max(p.id);
+            if p.name.trim().is_empty() {
+                p.name = format!("Profile {}", p.id);
+            }
+        }
+        cfg.midi.next_profile_id = cfg.midi.next_profile_id.max(max_p + 1);
+        if cfg.midi.profile(cfg.midi.active_profile).is_none() {
+            cfg.midi.active_profile = cfg.midi.profiles[0].id;
+        }
+        let channel_ids: HashSet<u64> = cfg.channels.iter().map(|c| c.id).collect();
+        let valid = |t: &MidiTarget| match t {
+            MidiTarget::ChannelVolume { id, .. } | MidiTarget::ChannelMute { id, .. } => {
+                channel_ids.contains(id)
+            }
+            MidiTarget::SelectProfile { profile } => seen_p.contains(profile),
+            MidiTarget::MasterVolume { .. } | MidiTarget::MasterMute { .. } => true,
+        };
+        for p in &mut cfg.midi.profiles {
+            p.bindings
+                .retain(|b| valid(&b.target) && !matches!(b.target, MidiTarget::SelectProfile { .. }));
+        }
+        cfg.midi.global_bindings.retain(|b| valid(&b.target));
         cfg
     }
 
