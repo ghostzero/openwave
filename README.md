@@ -51,6 +51,14 @@ stays free of DMCA-problematic audio.
   audio track, so music can play live but stay out of the VOD/recording.
 - **Master volume and mute** for every mix, plus live level meters
   everywhere.
+- **MIDI controllers**: right-click any fader or mute button and move a
+  knob, fader, or pad to bind it (MIDI learn). Binding *profiles* turn a
+  pad controller into a bank switcher, LED feedback mirrors mute and
+  profile state on the hardware, and fader pickup prevents volume jumps
+  after switching profiles. Controllers are hotplugged automatically.
+- **D-Bus control API** on the session bus: set volumes, toggle mutes, and
+  switch MIDI profiles from scripts, hotkey daemons, stream-deck software,
+  or desktop widgets — no plugins required.
 - **Self-healing routing**: OpenWave re-applies volumes and re-attaches
   streams if the session manager moves them, and cleans up stale devices
   from crashed sessions on startup.
@@ -103,13 +111,13 @@ git clone https://aur.archlinux.org/openwave.git && cd openwave && makepkg -si
 Build dependencies (Fedora):
 
 ```sh
-sudo dnf install gtk4-devel libadwaita-devel pulseaudio-libs-devel
+sudo dnf install gtk4-devel libadwaita-devel pulseaudio-libs-devel alsa-lib-devel
 ```
 
 Build dependencies (Debian/Ubuntu):
 
 ```sh
-sudo apt install libgtk-4-dev libadwaita-1-dev libpulse-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev libpulse-dev libasound2-dev
 ```
 
 Then:
@@ -146,6 +154,48 @@ opens the plugin's native UI — edits made there are synced back and the
 full plugin state is saved when the window closes. The VST rack processes
 first, then the LV2 chain; everything is restored automatically on the
 next start.
+
+### MIDI controllers
+
+Connect any class-compliant MIDI surface (fader banks, pad controllers,
+keyboards with knobs) and **right-click a fader or mute button** — then
+move the physical control to bind it. Bindings live in *profiles*
+(**Main Menu → MIDI Controllers…**): bind pads to profiles and one small
+pad controller can switch between, say, a *Monitor* layer, a *Stream*
+layer, and a per-channel layer for its faders. Pads bound to mutes and
+profiles light up to mirror the current state (the lit/dark velocities
+are configurable, which selects the color on many pad controllers), and
+*fader pickup* keeps a fader inert after a profile switch until it
+crosses the current level. Everything is stored per controller name, so
+bindings survive replugging.
+
+### Scripting via D-Bus
+
+OpenWave exports `de.ghostzero.OpenWave.Mixer1` at
+`/de/ghostzero/OpenWave/Mixer` on the session bus while it runs —
+usable from GNOME/KDE custom shortcuts, stream-deck tools, status-bar
+widgets, or plain shell scripts:
+
+```sh
+# What channels exist?
+gdbus call --session --dest de.ghostzero.OpenWave \
+  --object-path /de/ghostzero/OpenWave/Mixer \
+  --method de.ghostzero.OpenWave.Mixer1.ListChannels
+
+# Cough button: toggle the microphone in the stream mix (channel id 1)
+gdbus call --session --dest de.ghostzero.OpenWave \
+  --object-path /de/ghostzero/OpenWave/Mixer \
+  --method de.ghostzero.OpenWave.Mixer1.ToggleChannelMute 1 stream
+
+# Set the monitor master volume to 50%
+gdbus call --session --dest de.ghostzero.OpenWave \
+  --object-path /de/ghostzero/OpenWave/Mixer \
+  --method de.ghostzero.OpenWave.Mixer1.SetMasterVolume monitor 0.5
+```
+
+`GetVolumes` returns the whole mixer state as JSON, and the
+`StateChanged` signal fires (debounced) after any change — subscribe and
+re-query to keep an external display in sync.
 
 ## How it works
 

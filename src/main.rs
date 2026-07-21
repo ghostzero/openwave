@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod fx;
 mod lv2;
+mod midi;
 mod ui;
 mod vst;
 

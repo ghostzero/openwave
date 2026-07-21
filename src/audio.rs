@@ -73,12 +73,33 @@ fn loopback_args(source: &str, sink: &str, tag: &str) -> String {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Mix {
     Monitor,
     Stream,
     /// Optional third bus for a VOD-safe recording track.
     Vod,
+}
+
+impl Mix {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Mix::Monitor => "Monitor",
+            Mix::Stream => "Stream",
+            Mix::Vod => "VOD",
+        }
+    }
+
+    /// Parse the serde/D-Bus name ("monitor" | "stream" | "vod").
+    pub fn from_key(key: &str) -> Option<Mix> {
+        match key {
+            "monitor" => Some(Mix::Monitor),
+            "stream" => Some(Mix::Stream),
+            "vod" => Some(Mix::Vod),
+            _ => None,
+        }
+    }
 }
 
 /// Addresses one managed loopback, for the fast post-load volume apply.
