@@ -69,5 +69,9 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/de.ghostzero.OpenWave
 %{_datadir}/icons/hicolor/scalable/apps/de.ghostzero.OpenWave.svg
 
 %changelog
+* Tue Jul 21 2026 René Preuß <hello@ghostzero.de> - 0.6.0-1
+- Optional VOD Mix: third bus and "Virtual VOD Mix" microphone for a
+  VOD-safe second recording track
+
 * Mon Jul 20 2026 René Preuß <hello@ghostzero.de> - 0.5.0-1
 - Initial package
