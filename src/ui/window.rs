@@ -59,6 +59,7 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let sidebar = Sidebar::new();
 
     outputs.load_config(&config.borrow().master);
+    outputs.set_vod_visible(config.borrow().vod_mix_enabled);
 
     // ---- Mixer page ----------------------------------------------------------
     // Strips keep a fixed width; the row scrolls instead of stretching.
@@ -148,10 +149,11 @@ pub fn build(application: &adw::Application) -> adw::ApplicationWindow {
     let menu_settings = gio::Menu::new();
     menu_settings.append(Some("Audio Setup…"), Some("win.setup"));
     menu_settings.append(Some("Wave XLR…"), Some("win.wave-xlr"));
+    menu_settings.append(Some("Enable VOD Mix"), Some("win.vod-mix"));
     menu_settings.append(Some("Start at Login"), Some("win.autostart"));
     menu.append_section(None, &menu_settings);
     let menu_general = gio::Menu::new();
-    menu_general.append(Some("About OpenWave"), Some("win.about"));
+    menu_general.append(Some("About"), Some("win.about"));
     menu_general.append(Some("Quit"), Some("app.quit"));
     menu.append_section(None, &menu_general);
     let menu_button = gtk::MenuButton::builder()
@@ -302,6 +304,7 @@ fn wire_audio_events(app: &Rc<App>) {
                 }
                 LevelTarget::MonitorMix => app.outputs.monitor_level.set_levels(&v),
                 LevelTarget::StreamMix => app.outputs.stream_level.set_levels(&v),
+                LevelTarget::VodMix => app.outputs.vod_level.set_levels(&v),
             },
             AudioEvent::VstChanged(id) => {
                 let hooks = app
@@ -414,10 +417,12 @@ fn rebuild_strips(app: &Rc<App>) {
         app.strips_box.remove(&child);
     }
     let channels = app.config.borrow().channels.clone();
+    let vod = app.config.borrow().vod_mix_enabled;
     let mut strips = Vec::with_capacity(channels.len());
     for ch in &channels {
         let strip = ChannelStrip::new();
         strip.load_config(ch);
+        strip.set_vod_visible(vod);
         if ch.permanent {
             // Shown but disabled: permanent strips keep the exact same
             // header layout as removable ones.
@@ -522,7 +527,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
     {
         let app = app.clone();
         let guard = strip.guard.clone();
-        let other = strip.stream_scale.clone();
+        let others = [strip.stream_scale.clone(), strip.vod_scale.clone()];
         strip.monitor_scale.connect_value_changed(move |scale| {
             if guard.get() {
                 return;
@@ -538,7 +543,9 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             };
             app.manager.apply_channel_mix(id, Mix::Monitor);
             if linked {
-                other.set_value(v);
+                for other in &others {
+                    other.set_value(v);
+                }
             }
             schedule_save(&app);
         });
@@ -547,7 +554,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
     {
         let app = app.clone();
         let guard = strip.guard.clone();
-        let other = strip.monitor_scale.clone();
+        let others = [strip.monitor_scale.clone(), strip.vod_scale.clone()];
         strip.stream_scale.connect_value_changed(move |scale| {
             if guard.get() {
                 return;
@@ -563,7 +570,36 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             };
             app.manager.apply_channel_mix(id, Mix::Stream);
             if linked {
-                other.set_value(v);
+                for other in &others {
+                    other.set_value(v);
+                }
+            }
+            schedule_save(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
+        let others = [strip.monitor_scale.clone(), strip.stream_scale.clone()];
+        strip.vod_scale.connect_value_changed(move |scale| {
+            if guard.get() {
+                return;
+            }
+            let v = scale.value();
+            let linked = {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
+                    return;
+                };
+                ch.vod_volume = v;
+                ch.linked
+            };
+            app.manager.apply_channel_mix(id, Mix::Vod);
+            if linked {
+                for other in &others {
+                    other.set_value(v);
+                }
             }
             schedule_save(&app);
         });
@@ -610,8 +646,28 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
     {
         let app = app.clone();
         let guard = strip.guard.clone();
+        strip.vod_mute.connect_toggled(move |btn| {
+            if guard.get() {
+                return;
+            }
+            {
+                let mut cfg = app.config.borrow_mut();
+                let Some(ch) = cfg.channel_mut(id) else {
+                    return;
+                };
+                ch.vod_muted = btn.is_active();
+            }
+            app.manager.apply_channel_mix(id, Mix::Vod);
+            schedule_save(&app);
+        });
+    }
+
+    {
+        let app = app.clone();
+        let guard = strip.guard.clone();
         let monitor_scale = strip.monitor_scale.clone();
         let stream_scale = strip.stream_scale.clone();
+        let vod_scale = strip.vod_scale.clone();
         strip.link.connect_toggled(move |btn| {
             if guard.get() {
                 return;
@@ -625,6 +681,7 @@ fn wire_strip(app: &Rc<App>, strip: &ChannelStrip, id: u64) {
             }
             if btn.is_active() {
                 stream_scale.set_value(monitor_scale.value());
+                vod_scale.set_value(monitor_scale.value());
             }
             schedule_save(&app);
         });
@@ -787,6 +844,31 @@ fn wire_outputs(app: &Rc<App>) {
             }
             app.config.borrow_mut().master.stream_muted = btn.is_active();
             app.manager.apply_master_stream();
+            schedule_save(&app);
+        });
+    }
+    {
+        let app = app.clone();
+        app.clone()
+            .outputs
+            .vod_scale
+            .connect_value_changed(move |scale| {
+                if app.outputs.guard.get() {
+                    return;
+                }
+                app.config.borrow_mut().master.vod_volume = scale.value();
+                app.manager.apply_master_vod();
+                schedule_save(&app);
+            });
+    }
+    {
+        let app = app.clone();
+        app.clone().outputs.vod_mute.connect_toggled(move |btn| {
+            if app.outputs.guard.get() {
+                return;
+            }
+            app.config.borrow_mut().master.vod_muted = btn.is_active();
+            app.manager.apply_master_vod();
             schedule_save(&app);
         });
     }
@@ -1017,6 +1099,31 @@ fn wire_actions(app: &Rc<App>, window: &adw::ApplicationWindow) {
         });
     }
     window.add_action(&add);
+
+    let vod = gio::SimpleAction::new_stateful(
+        "vod-mix",
+        None,
+        &app.config.borrow().vod_mix_enabled.to_variant(),
+    );
+    {
+        let app = app.clone();
+        vod.connect_activate(move |action, _| {
+            let enable = !action
+                .state()
+                .and_then(|s| s.get::<bool>())
+                .unwrap_or(false);
+            action.set_state(&enable.to_variant());
+            app.config.borrow_mut().vod_mix_enabled = enable;
+            app.manager.apply_vod_mix();
+            app.outputs.set_vod_visible(enable);
+            for (_, strip) in app.strips.borrow().iter() {
+                strip.set_vod_visible(enable);
+            }
+            schedule_save(&app);
+            update_sidebar(&app);
+        });
+    }
+    window.add_action(&vod);
 
     let setup_action = gio::SimpleAction::new("setup", None);
     {

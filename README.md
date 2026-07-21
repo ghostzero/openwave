@@ -20,6 +20,13 @@ Every input channel has **two independent faders**:
 This lets you, for example, listen to music loudly while streaming it
 quietly, or hear a voice chat that never reaches your stream at all.
 
+An optional third mix — the **VOD Mix**, enabled from the main menu — adds a
+third fader per channel and a second virtual microphone, **“Virtual VOD
+Mix”**. In OBS, assign *Virtual Stream Mix* to your live track and *Virtual
+VOD Mix* to the recording track, then pull the Music channel to zero on the
+VOD fader: your live audience hears the music, while your VOD/recording
+stays free of DMCA-problematic audio.
+
 ## Features
 
 - **Dynamic input channels** (up to 8): starts with *Microphone* and
@@ -40,7 +47,9 @@ quietly, or hear a voice chat that never reaches your stream at all.
   OpenWave's own UI. Effects are applied before the monitor/stream split,
   so both mixes hear the processed signal.
 - **Per-channel, per-mix volume and mute**, with optional fader linking.
-- **Master volume and mute** for both mixes, plus live level meters
+- **Optional VOD Mix**: a third bus (“Virtual VOD Mix”) for a second OBS
+  audio track, so music can play live but stay out of the VOD/recording.
+- **Master volume and mute** for every mix, plus live level meters
   everywhere.
 - **Self-healing routing**: OpenWave re-applies volumes and re-attaches
   streams if the session manager moves them, and cleans up stale devices
@@ -141,11 +150,12 @@ next start.
 ## How it works
 
 OpenWave talks to PipeWire through the PulseAudio client API on the GTK main
-loop. It creates two null-sink buses (`OpenWave_Monitor`, `OpenWave_Stream`),
-routes every channel through a pair of loopback streams (one per mix, each
-carrying its own volume and mute), exposes the stream bus as a real capture
-device via a remap source, and drives the level meters with low-rate
-peak-detect streams. All streams carry unique names and opt out of
+loop. It creates one null-sink bus per mix (`OpenWave_Monitor`,
+`OpenWave_Stream`, and `OpenWave_Vod` when the VOD Mix is enabled), routes
+every channel through one loopback stream per mix (each carrying its own
+volume and mute), exposes the stream and VOD buses as real capture devices
+via remap sources, and drives the level meters with low-rate peak-detect
+streams. All streams carry unique names and opt out of
 session-manager volume/target restoring, so the routing stays exactly as
 configured.
 

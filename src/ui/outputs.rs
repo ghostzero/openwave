@@ -8,8 +8,8 @@ use crate::config::MasterConfig;
 use super::{label_factory, meter_pair, mute_button, MeterPair};
 
 /// The OUTPUTS section: one row for the monitor mix (with hardware device
-/// selector) and one for the stream mix, each with level meter, master volume
-/// and master mute.
+/// selector), one for the stream mix, and — while the VOD mix is enabled —
+/// one for the VOD mix, each with level meter, master volume and master mute.
 pub struct OutputsPanel {
     pub root: gtk::ListBox,
     pub monitor_device: gtk::DropDown,
@@ -19,6 +19,10 @@ pub struct OutputsPanel {
     pub stream_level: MeterPair,
     pub stream_scale: gtk::Scale,
     pub stream_mute: gtk::ToggleButton,
+    pub vod_level: MeterPair,
+    pub vod_scale: gtk::Scale,
+    pub vod_mute: gtk::ToggleButton,
+    vod_row: gtk::ListBoxRow,
     pub guard: Rc<Cell<bool>>,
     /// Sink name behind each device drop-down position; `None` = system default.
     pub sink_entries: RefCell<Vec<Option<String>>>,
@@ -143,15 +147,33 @@ impl OutputsPanel {
             &titles_group,
         );
 
-        // Keep the middle column of both rows equally wide so the level
+        let vod_level = meter_pair();
+        let vod_scale = master_scale("VOD mix master volume");
+        let vod_mute = mute_button("camera-video-symbolic", "Mute the VOD mix");
+        let vod_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let vod_row = output_row(
+            "camera-video-symbolic",
+            "VOD Mix",
+            "Select “Virtual VOD Mix” as a second audio track for recordings",
+            vod_spacer.upcast_ref(),
+            &vod_level.root,
+            &vod_scale,
+            &vod_mute,
+            &titles_group,
+        );
+        vod_row.set_visible(false);
+
+        // Keep the middle column of all rows equally wide so the level
         // meters and master sliders line up exactly. The titles group does
         // the same for the title/subtitle column.
         let middle_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
         middle_group.add_widget(&monitor_device);
         middle_group.add_widget(&stream_spacer);
+        middle_group.add_widget(&vod_spacer);
 
         root.append(&monitor_row);
         root.append(&stream_row);
+        root.append(&vod_row);
 
         Self {
             root,
@@ -162,6 +184,10 @@ impl OutputsPanel {
             stream_level,
             stream_scale,
             stream_mute,
+            vod_level,
+            vod_scale,
+            vod_mute,
+            vod_row,
             guard: Rc::new(Cell::new(false)),
             sink_entries: RefCell::new(Vec::new()),
             last_labels: RefCell::new(Vec::new()),
@@ -174,9 +200,15 @@ impl OutputsPanel {
         self.guard.set(true);
         self.monitor_scale.set_value(m.monitor_volume);
         self.stream_scale.set_value(m.stream_volume);
+        self.vod_scale.set_value(m.vod_volume);
         self.monitor_mute.set_active(m.monitor_muted);
         self.stream_mute.set_active(m.stream_muted);
+        self.vod_mute.set_active(m.vod_muted);
         self.guard.set(false);
+    }
+
+    pub fn set_vod_visible(&self, visible: bool) {
+        self.vod_row.set_visible(visible);
     }
 
     /// Rebuild the monitor output device selector.

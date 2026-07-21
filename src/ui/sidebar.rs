@@ -10,6 +10,7 @@ pub struct Sidebar {
     pub root: gtk::ScrolledWindow,
     monitor_row: adw::ActionRow,
     stream_row: adw::ActionRow,
+    vod_row: adw::ActionRow,
     channels_group: adw::PreferencesGroup,
     channel_rows: RefCell<Vec<adw::ActionRow>>,
 }
@@ -33,6 +34,17 @@ impl Sidebar {
             .build();
         stream_row.add_prefix(&gtk::Image::from_icon_name("audio-input-microphone-symbolic"));
         outputs_group.add(&stream_row);
+
+        let vod_row = adw::ActionRow::builder()
+            .title("VOD Mix")
+            .subtitle(
+                "Available as the “Virtual VOD Mix” microphone — use it as a \
+                 second audio track to keep music out of recordings",
+            )
+            .visible(false)
+            .build();
+        vod_row.add_prefix(&gtk::Image::from_icon_name("camera-video-symbolic"));
+        outputs_group.add(&vod_row);
 
         let channels_group = adw::PreferencesGroup::builder()
             .title("Channel Assignments")
@@ -58,6 +70,7 @@ impl Sidebar {
             root,
             monitor_row,
             stream_row,
+            vod_row,
             channels_group,
             channel_rows: RefCell::new(Vec::new()),
         }
@@ -72,6 +85,7 @@ impl Sidebar {
         self.monitor_row
             .set_subtitle(&format!("Routed to {monitor_device_label}"));
         let _ = &self.stream_row;
+        self.vod_row.set_visible(config.vod_mix_enabled);
 
         let mut rows = self.channel_rows.borrow_mut();
         while rows.len() > config.channels.len() {
