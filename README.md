@@ -39,6 +39,10 @@ quietly, or hear a voice chat that never reaches your stream at all.
   bypassed, and tweaked with live parameter sliders entirely inside
   OpenWave's own UI. Effects are applied before the monitor/stream split,
   so both mixes hear the processed signal.
+- **One-click noise removal**: a *Noise Removal* switch on every
+  microphone channel inserts a ready-configured RNNoise suppressor
+  (`noise-suppression-for-voice`) at the front of the channel's effect
+  chain — no plugin browsing needed.
 - **Per-channel, per-mix volume and mute**, with optional fader linking.
 - **Master volume and mute** for both mixes, plus live level meters
   everywhere.
@@ -137,6 +141,14 @@ opens the plugin's native UI — edits made there are synced back and the
 full plugin state is saved when the window closes. The VST rack processes
 first, then the LV2 chain; everything is restored automatically on the
 next start.
+
+Channels assigned to a capture source also get a *Noise Removal* switch
+directly on the strip: it inserts the RNNoise suppressor from
+`noise-suppression-for-voice` at the front of the LV2 chain (and appears
+as a regular chain entry in the effects dialog, where its strength can be
+tuned). Switching it off bypasses the effect but keeps its settings. If
+the plugin isn't installed, the switch points you at the right package
+for your distribution.
 
 ## How it works
 
