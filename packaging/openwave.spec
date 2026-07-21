@@ -72,6 +72,13 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/de.ghostzero.OpenWave
 %{_datadir}/icons/hicolor/scalable/apps/de.ghostzero.OpenWave.svg
 
 %changelog
+* Wed Jul 22 2026 René Preuß <hello@ghostzero.de> - 0.7.0-1
+- MIDI controller support: MIDI learn on every fader and mute, binding
+  profiles switchable from pads, LED feedback, fader pickup, hotplug
+- D-Bus control API (de.ghostzero.OpenWave.Mixer1) for scripting,
+  hotkeys and external controllers
+- New build dependency: alsa-lib-devel
+
 * Tue Jul 21 2026 René Preuß <hello@ghostzero.de> - 0.6.0-1
 - Optional VOD Mix: third bus and "Virtual VOD Mix" microphone for a
   VOD-safe second recording track
