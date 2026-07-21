@@ -99,11 +99,11 @@ sudo dnf copr enable ghost0/openwave
 sudo dnf install openwave
 ```
 
-### Arch Linux (AUR) — coming soon
+### Arch Linux (AUR)
 
 ```sh
-yay -S openwave        # or paru -S openwave, or build manually:
-git clone https://aur.archlinux.org/openwave.git && cd openwave && makepkg -si
+yay -S openwave-mixer        # or paru -S openwave-mixer, or build manually:
+git clone https://aur.archlinux.org/openwave-mixer.git && cd openwave-mixer && makepkg -si
 ```
 
 ### From source
